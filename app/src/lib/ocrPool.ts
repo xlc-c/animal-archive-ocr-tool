@@ -55,6 +55,7 @@ export class OcrPool {
     const det = injected?.det ? b64ToBytes(injected.det) : null
     const rec = injected?.rec ? b64ToBytes(injected.rec) : null
     const wasm = injected?.wasm ? b64ToBytes(injected.wasm) : null
+    const cls = injected?.cls ? b64ToBytes(injected.cls) : null
     const dict = injected?.dict ?? ''
     const baseUrl = new URL(import.meta.env.BASE_URL || './', location.href).href
     for (let i = 0; i < size; i++) {
@@ -64,12 +65,23 @@ export class OcrPool {
       w.onerror = (e: Event) => this.onWorkerError(w, e)
       if (det && rec && wasm) {
         const parts = [det.slice(0), rec.slice(0), wasm.slice(0)]
+        const bin: Record<string, unknown> = {
+          det: parts[0].buffer,
+          rec: parts[1].buffer,
+          wasm: parts[2],
+          dict,
+        }
+        if (cls) {
+          const c = cls.slice(0)
+          parts.push(c)
+          bin.cls = c.buffer
+        }
         this.post(
           w,
           {
             seq: this.nextSeq(),
             cmd: 'init',
-            bin: { det: parts[0].buffer, rec: parts[1].buffer, wasm: parts[2], dict },
+            bin,
             baseUrl,
           },
           parts.map((p) => p.buffer)
@@ -113,6 +125,15 @@ export class OcrPool {
     const seq = this.nextSeq()
     const p = this.expect<OcrPageResult>(seq)
     this.dispatch((call) => call({ seq, cmd: 'ocr', docId, pageIndex, hd }))
+    return p
+  }
+
+  /** 编号格放大重识别：整页+高清重试都认不出编号时的三级重试 */
+  ocrIdCell(docId: string, pageIndex: number): Promise<OcrPageResult> {
+    if (this.broken) return Promise.reject(new Error(BROKEN_MSG))
+    const seq = this.nextSeq()
+    const p = this.expect<OcrPageResult>(seq)
+    this.dispatch((call) => call({ seq, cmd: 'ocrIdCell', docId, pageIndex }))
     return p
   }
 

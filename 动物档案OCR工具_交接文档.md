@@ -31,17 +31,21 @@ bash rebuild.sh    # 完整构建：dist/ + dist-offline/（单文件离线版�
 - Node 20+。依赖见 package.json（React 19 + Vite 7 + Tailwind + shadcn/ui + pdfjs-dist + pdf-lib + JSZip + xlsx + onnxruntime-web@1.22.0）
 - `rebuild.sh` 会复制项目到 /tmp/build-app 构建，再经 `tools/make-offline.mjs` 把 JS/CSS/模型 base64 内联成单个 HTML。**本机已适配**：SRC 取脚本所在目录；本机未独立安装 Node，找不到 npm 时自动回退 Kimi 自带运行时（`/c/Users/Administrator/AppData/Local/Programs/Kimi/resources/resources/runtime`，node 24 + npm 11）；已加 `pipefail`，构建失败不会再被管道吞掉
 - 本机没有标准 Downloads 目录，浏览器下载在 `D:\Backup\Downloads`
-- **日常使用（脱离 VS Code / 开发环境）**：`app/dist/index.html` 与 `app/dist-offline/index.html` 是同一个 40.5MB 单文件（JS/CSS/ONNX 模型/wasm/字典全部 base64 内联），**双击即用、离线可用、可随意复制分发**（U 盘/别的电脑都行，Edge/Chrome 均可）。项目根目录放了一份改名副本 `动物档案OCR工具.html`，每次 rebuild 后需手动重新复制覆盖
+- **日常使用（脱离 VS Code / 开发环境）**：`app/dist/index.html` 与 `app/dist-offline/index.html` 是同一个 41.9MB 单文件（JS/CSS/ONNX 模型/wasm/字典全部 base64 内联），**双击即用、离线可用、可随意复制分发**（U 盘/别的电脑都行，Edge/Chrome 均可）。项目根目录放了一份改名副本 `动物档案OCR工具.html`，每次 rebuild 后需手动重新复制覆盖
 
 ## 3. 关键文件
 
 | 文件 | 作用 |
 |---|---|
-| `src/lib/paddleOcr.ts` | OCR 引擎：onnxruntime-web 会话管理、DB 文本检测 + CTC 识别、后处理、垃圾行过滤 |
-| `src/lib/ocr.ts` | 信息提取：标题提取、编号多通道提取、花名册纠错、顺序推定、清单页检测 |
-| `src/App.tsx` | UI + 分段逻辑 + PDF 拆分/合并（pdf-lib）+ 命名 + ZIP/Excel 导出 |
+| `src/lib/paddleOcr.ts` | OCR 引擎：onnxruntime-web 会话管理、DB 文本检测 + 行识别、印章抑制、cls 倒置检测、后处理、垃圾行过滤 |
+| `src/lib/ctc.ts` | CTC 贪心解码 + top-2 单字符替换候选（纯函数，harness 直测） |
+| `src/lib/ocr.ts` | 信息提取：标题提取、编号多通道提取、花名册纠错（编辑距离+top-k 组合）、顺序推定、清单页检测、Excel 字段提取、文字层直通 |
+| `src/lib/ocrWorker.ts` / `src/lib/ocrPool.ts` | Worker 线程协议（init/open/ocr/ocrIdCell/close）与并行调度池 |
+| `src/lib/sexGlyph.ts` | ♀/♂ 性别符号像素级分类器 |
+| `src/lib/pageCache.ts` | 断点续跑：页级 OCR 结果 IndexedDB 缓存（LRU 6 文件） |
+| `src/App.tsx` | UI + 分段逻辑 + PDF 拆分/合并（pdf-lib）+ 中英交叉验证 + 命名 + ZIP/Excel 导出 |
 | `src/assets/binData.ts` | 读取 `window.__BIN__`（离线版注入的模型数据），Web 版回退到 `public/models/` 拉取 |
-| `assets-bin/` | det.onnx(4.7MB) / rec.onnx(10.8MB) / dict.txt / ort.wasm —— 离线版数据源 |
+| `assets-bin/` | det.onnx(4.7MB) / rec.onnx(10.8MB) / cls.onnx(1.0MB) / dict.txt / ort.wasm —— 离线版数据源 |
 | `public/models/` `public/ort/` | Web 预览版模型与 WASM 运行时（与 assets-bin 内容重复，两者都必须保留） |
 | `tools/make-offline.mjs` | 离线单文件打包器 |
 | `rebuild.sh` | 一键构建脚本 |
@@ -70,7 +74,7 @@ bash rebuild.sh    # 完整构建：dist/ + dist-offline/（单文件离线版�
 ### 工具链层
 16. **构建验证**：改完必须 `bash rebuild.sh` 跑通，并在浏览器实测至少一批真实文件。
 17. 历史上某平台的 edit_file 工具对 App.tsx 偶发"成功但没落盘"——AI 接手方修改文件后**务必 grep 验证**改动确实写入。
-18. **离线断言 harness**（2026-08-19 引入）：用 esbuild 把 `src/lib/ocr.ts` 打桩打包（pdfjs/paddleOcr/worker 全部 stub，只测纯函数），node 直接跑 extractTitle/extractArchiveRow/extractInfo 断言。脚本放在 /tmp/regress（临时，test-run.mjs + test-extract.entry.ts），需要时按此重建；这批纯逻辑函数以后改动都该先过断言再 rebuild。当前 40 条断言。
+18. **离线断言 harness**（2026-08-19 引入）：用 esbuild 把 `src/lib/ocr.ts` 打桩打包（pdfjs/paddleOcr/worker 全部 stub，只测纯函数），node 直接跑 extractTitle/extractArchiveRow/extractInfo 断言。脚本放在 /tmp/regress（临时，test-run.mjs + test-extract.entry.ts），需要时按此重建；这批纯逻辑函数以后改动都该先过断言再 rebuild。当前 79 条断言。
 
 ### 并行与性能层（2026-08-20 新增）
 19. **OCR 走 Web Worker 池**（`src/lib/ocrWorker.ts` + `src/lib/ocrPool.ts`）：并行度按 `navigator.hardwareConcurrency/4` 自动定、3 路封顶（每路要吃模型+页面位图内存）。浏览器读不到系统 CPU 占用率，这是唯一能自动拿到的指标。要点：**`window.__BIN__` 只在主线程存在**，模型字节由主线程解码后经 postMessage(transfer) 分发给每个 Worker（binData.ts 的 setBinBytes/getBinBytes 通道）；**Vite 必须 `worker.format: 'iife'`**——es(module) Worker 在 file:// 下会被 Chromium 异步拒绝（曾按错误记忆写成 es，导致离线版全灭，见踩坑 32）；classic Worker 里 onnxruntime 的 dynamic import() 实测正常。OCR Worker 里嵌套 pdfjs inline worker（`?worker&inline`）在 Chromium 可用。
@@ -90,14 +94,25 @@ bash rebuild.sh    # 完整构建：dist/ + dist-offline/（单文件离线版�
 31. **C-LOT 接收档案是第三种猴版式 + 手写符号**（2026-08-20 实测）：「实验猴个体档案」用 父号：/母号：/性别： 独立标签行、值在右侧格。两个教训：① 体重正则的分隔符类必须含**全角冒号** `：`，「体重：\n3.30」曾因此漏抓；② 该版式性别格是**手写 ♂**（圆圈不闭合，孔洞检测漏过）——分类器返回 null 是正确行为，留空+待核对，不要为单个手写样本放松阈值误伤印刷体。性别符号分类器的标签匹配已扩展支持独立「性别：」行（印刷符号的该类版式可自动识别）。**排障工具**：ZIP 里附带 `_OCR原文汇总.txt`（每段完整 OCR 文本），浏览器端与 Python 复现管线的渲染差异（pdfjs vs pymupdf）会导致个别行粘连/丢失，字段对不上时先看它。
 32. **file:// 下 blob: module Worker 被异步拒绝——离线版曾因此全灭**（2026-08-20 定位）：用户把 html 从 zip 里双击（解压到 Temp）或任何 file:// 直开，点开始处理永远卡「打开文件 · 2%」，console 报 `Refused to cross-origin redirects of the top-level worker script` ×N。有头 Edge CDP 探针实测（与路径/Temp/MOTW 无关，file:// 通病）：**blob: classic Worker ✓、blob: module Worker ✗（异步 error 事件）、data: classic/module ✓ 但 data: URL 超过 ~2MB 同样异步失败**。Vite `?worker&inline` 的引导是「先 blob:，同步抛错才退 data:」——blob module 的失败是异步的，兜底永远走不到。修法：`vite.config.ts` 的 `worker.format` 改回 `'iife'`（classic）——classic blob Worker 在 file:// 正常、无 2MB 上限，且 classic 脚本里 dynamic import() 依然可用（ORT 在 Worker 内加载 wasm 工厂不受影响，e2e 实证；踩坑 19 旧说法作废）。**附带加固**：ocrPool 之前完全没有监听 Worker 的 error 事件，Worker 一死所有 Promise 永久悬置（卡死的直接观感）；现 onerror 会摘除死亡 Worker、reject 挂在它身上的调用、全灭时置 broken 并给出明确错误文案，getOcrPool 下次调用自动重建。**验证方法**：CDP 端到端（`/tmp/regress/cdp_e2e.mjs`：有头 Edge + `DOM.setFileInputFiles` 喂真实 PDF + 轮询页面文本），file:// Temp 副本跑猪档案 8/8 拆出、console 0 错误。改 Worker 相关构建配置后必须重跑这个 e2e，别再只看构建通过。
 
+### 构建与资源层（2026-08-21 新增）
+33. **rebuild.sh 的 `cp -r` 嵌套坑**：`cp -r $SRC/tools $BUILD/tools` 在目标已存在时会嵌套成 `tools/tools`，旧 make-offline.mjs 残留导致**打包脚本改动静默不生效**（表现为 html 里缺新注入的资源键，文件大小不变是最快信号）。已对 tools 先 `rm -rf` 再拷。改 make-offline.sh/binData 链路后，先 grep 产物确认新字段在 html 里。
+34. **新增模型/资源要穿透四层**：`assets-bin/`（源）→ `tools/make-offline.mjs`（__BIN__ 注入）→ `src/assets/binData.ts`（访问层 + BinBytes 类型）→ `ocrPool`（base64 解码 + transfer 给 Worker）→ `paddleOcr.initEngine`（建 session）；网页版还要 `public/models/` 兜底。断任何一层，Worker 里静默拿不到模型。
+35. **合格证二维码直通：实测不可行，已否决**（2026-08-21）：江苏省实验动物质量合格证左下角确有二维码，但扫描件上仅 ~150px 宽、模块边缘洇开。zxing-js（MultiFormat/QRCodeReader × Hybrid/GlobalHistogram 两种二值化 × 整页/区域裁剪）与 OpenCV QRCodeDetector（原图/放大 2-4×/多档阈值/Otsu 共 9 种变体）全部解不出（最好成绩：检出定位点但解码为空）。前提是「100% 准确」，源不可解码则功能是死重。探针脚本 `/tmp/regress/qr_probe.py` + `qrprobe/probe2.mjs`。
+36. **en_PP-OCRv5_mobile_rec 英文行路由：A/B 后否决**（2026-08-21，脚本 `/tmp/regress/ink_route_probe.py` / `enrec_ab.py`）：① 行前路由不可行——墨迹密度（48px 白底裁片暗像素占比）中英严重重叠：纯英文行 0.062~0.373（大写标题行 DESCRIPTION=0.373），含中文行 0.103 起（出生日期/Dateofbirth），没有可用阈值；② 「v4 输出纯 ASCII 且 conf<0.98 则 v5 复跑取高置信」的门控方案实测 +9/-2：v5 能修尾巴垃圾（`5-28-26[`→`5-28-26`），但也会把对的改错（`6-17-26`→`G-17-26`，`29.93`→`29.92`）；③ 关键认识：v5 修掉的边沿垃圾下游解析（DATE_RE/tokenFromText 的前缀匹配）本来就免疫，字段级收益≈0，却要多带 7.9MB 模型（离线包 +10.8MB）。**结论：不接。** v4 对数字类字段（编号/日期/体重）置信度已 ≈1.0，真正的精度瓶颈从来不是英文行。
+37. **PP-OCRv5_mobile_det 亦否决**（2026-08-21）：实测比 v4 慢 22%（121→147ms/页），唯一框差异在圆形印章区（v4 碎 10 框、v5 并 1 大框），而印章已由红像素抑制处理（下条）——净收益为零。
+38. **红色印章用像素级抑制而非通道变换**（2026-08-21，`paddleOcr.ts suppressRedSeal`）：`r>130 且 r-g>45 且 r-b>45` 置白，det 与 rec 裁片统一用处理后图。Python A/B（`ab_seal.py`）：猪页红像素 0%（无风险）；犬页 0.6~0.7%，章环文垃圾行清除、章下英文行读得更全、无关键编号行丢失。阈值保守，暗红/棕色字迹（整体暗）不会误伤。
+39. **CTC top-k 候选纠错**（2026-08-21，`lib/ctc.ts`）：ctcDecode 记录每个已发射字符位的 top2，概率比 ≥0.25 的分歧位取 top-2 各生成一个单字符替换串（alts）；只有编号形态的行挂 alts（控制传输量）；alts 进 extractInfo 的 idCandidates；applyRoster 在编辑距离判不出唯一时，候选池**唯一精确命中**花名册才采用（hits.length===1 硬门槛，防清单页/串号误救）。合成张量断言 + e2e 双验证。
+40. **cls 方向分类处理倒置页**（2026-08-21）：PP-LCNet_x0_25 cls（1.0MB，静态 [B,3,80,160]，输出 [B,2]）。recognizeCanvasPaddle 里 det 后取**最高的 8 行**裁片（文字行比碎片高，判定最稳）投票，≥3 票且过半、置信 >0.9 判倒置 → 整页旋转 180° 重跑 det+rec。预处理跟 RapidOCR：保宽高比到 H=80、右侧中灰补零到 160、[-1:1] 归一化。正常页开销 ≤8 次 ~1ms 推理。合成倒置猪档案 e2e 实证 8/8。注意 cls onnx 输出名是 `fetch_name_0`，按位置取。
+41. **断点续跑缓存**（2026-08-21，`lib/pageCache.ts`）：页级 OCR 最终结果（debug+info）存 IndexedDB，key=文件名+大小+修改时间。三条铁律：① 缓存永不阻塞主流程（隐私模式/配额满静默降级）；② 只存页级结果，花名册纠错/推定是文档级后处理每跑重算；③ 失败页**不缓存**（可能是 Worker 瞬时错误，值得真重试）。LRU 保留最近 6 个文件。同一文件二次拖入全缓存命中时免 OCR 直接拆分（e2e 实证二跑秒出）。
+
 ## 5. 当前已完成功能
 
 - PP-OCRv4 mobile 中英识别、多通道编号提取（标签 > 文件名 > 候选池 > 兜底）
 - **多 Worker 并行 OCR**（按 CPU 核数自动定并行度，3 路封顶；pdfjs 渲染 + OCR 全在 Worker 线程）
-- 花名册纠错 + 顺序推定 + 清单页检测
+- 花名册纠错 + 顺序推定 + 清单页检测；**用户粘贴编号清单当外部花名册**（<5 只小批次救星，UI 折叠区粘贴）
 - 按编号/按页拆分、中英文同编号合并（默认开启「合并相同编号」）
-- 命名：动物编号 / 标题 / 合格证、检疫证明、检测报告、发票等单据 `No.{编号}`（含裸 No./№/流水号/报告编号版式）
-- 模糊页高清重试开关、处理历史记忆
+- 命名：动物编号 / 标题 / 合格证、检疫证明、检测报告、发票等单据 `No.{编号}`（含裸 No./№/流水号/报告编号版式）；**自定义命名模板**（`{编号}`/`{标题}`/`{来源}` 占位符，localStorage 记忆）
+- 模糊页高清重试开关、**编号格放大 2.5× 三级重试**（顽固页）、处理历史记忆
 - ZIP 打包下载、Excel 档案汇总表（动物编号/性别/出生日期/父母编号/最新体重/来源/页码/备注；犬/猴/猪三种档案版式均可提取）
 - **结果列表手动改名**（行内编辑，下载/ZIP/Excel 均生效，可一键恢复自动命名）
 - **可疑项高亮置顶**（顺序推定 / 花名册纠错 corrected / 低可信候选池 lowConf / 未识别 / 性别未识别 → 置顶 + 琥珀色高亮 + 「待核对」标签）+ **只看待核对筛选**
@@ -105,6 +120,12 @@ bash rebuild.sh    # 完整构建：dist/ + dist-offline/（单文件离线版�
 - **批次摘要**（结果标题下：本批 N 个文件、动物 X 只、单据 Y 个、未识别 Z 个、待核对数）
 - 标题碎片防护 + Excel 字段耳号行锚定（见踩坑 13/14）
 - **♀/♂ 性别符号图像级识别**（绕过 rec 字典限制：det 框定位性别格 + 孔洞/左右对称/区域密度分类，见踩坑 29）
+- **PDF 原生文字层直通**（getTextContent ≥30 字符判定非扫描页，免渲染免 OCR，秒出）
+- **红色印章像素抑制**（饱和红置白，章压字恢复可读，见踩坑 38）
+- **中英文双版交叉验证**（合并时按 CJK 占比分组互查 性别/出生日期/父母编号/体重 五字段，不一致标红 + Excel 备注写差异明细）
+- **CTC top-k × 花名册组合纠错**（rec 次优路径单字符替换候选入候选池，唯一精确命中才救，见踩坑 39）
+- **180° 倒置扫描页自动转正**（cls 行级投票，见踩坑 40）
+- **断点续跑**（页级结果 IndexedDB 缓存，中断后重拖同一文件只补剩余页；全命中免 OCR 直接拆，见踩坑 41）
 
 ## 6. 待办清单（已与需求方讨论确认方向，按优先级）
 
@@ -113,26 +134,26 @@ bash rebuild.sh    # 完整构建：dist/ + dist-offline/（单文件离线版�
 - [x] 低置信/推定/纠错过的结果高亮置顶
 - [x] 批次摘要（"9 个文件，8 只全部识别，2 个推定需核对"）
 
-**第二组 · 精度放大**
-- [ ] 用户粘贴编号清单当花名册（解决 <5 只小批次花名册失效）
-- [ ] 命名模板自定义（`{编号}_{日期}` 等）
+**第二组 · 精度放大（2026-08-21 全组清零）**
+- [x] 用户粘贴编号清单当花名册（解决 <5 只小批次花名册失效）（2026-08-21）
+- [x] 命名模板自定义（`{编号}_{日期}` 等）（2026-08-21）
 - [x] ~~页面缩略图悬停预览（核对命名用）~~ → 已由「结果在线预览」覆盖（2026-08-20）
-- [ ] 大文件分片处理 + 断点续跑
+- [x] 断点续跑（页级 IndexedDB 缓存，2026-08-21）；「大文件分片」由 Worker 池逐页派发天然成立，无需另行改造
 
-**第三组 · OCR 精度（免换模型）**
-- [ ] 红色印章滤除：取蓝色通道做 OCR 输入，消除印章压字
-- [ ] 中英文双版交叉验证：合并配对后同字段互查，不一致标红
-- [ ] CTC top-k 候选 × 花名册组合纠错（替代纯编辑距离）
-- [ ] 编号单元格裁剪放大 2-3 倍重识别
-- [ ] 合格证二维码直通（若证件上有码，zxing-js 解码，100% 准确）
-- [ ] 表格线检测切单元格（OpenCV.js，根治字段粘连；改动较大）
-- [ ] PDF 原生文字层直通（pdfjs getTextContent，非扫描页免 OCR）
+**第三组 · OCR 精度（免换模型）（2026-08-21 全组清零）**
+- [x] 红色印章滤除：实测改为**饱和红像素置白**（比取蓝色通道更保守，黑/蓝字迹零风险）（2026-08-21）
+- [x] 中英文双版交叉验证：合并时按 CJK 占比分组互查五字段，不一致标红 + Excel 备注（2026-08-21）
+- [x] CTC top-k 候选 × 花名册组合纠错（2026-08-21，见踩坑 39）
+- [x] 编号单元格裁剪放大 2.5 倍重识别（三级重试，2026-08-21）
+- [x] ~~合格证二维码直通~~ → **实测否决**：扫描件二维码 ~150px 模块洇开，zxing-js 与 OpenCV 全预处理变体均解不出（2026-08-21，见踩坑 35）
+- [ ] 表格线检测切单元格（OpenCV.js）→ **评估后暂缓**：+8MB wasm 且要绕开现有行序逻辑，而近几轮真实批次的残余误差根因（性别符号/印章/单字符误读）均已由更小的方案解决，当前没有「粘死到正则分不开」的未决样本。触发条件：出现真实粘连故障样本再做
+- [x] PDF 原生文字层直通（pdfjs getTextContent，非扫描页免 OCR）（2026-08-21）
 
-**第四组 · 模型升级（需 A/B 验证）**
-- [ ] det 换 PP-OCRv5_mobile_det（官方 Hmean 79.0 vs v4 63.8，体积同为 4.7MB）
-- [ ] rec 中文行保留 v4（第三方实测 v5 mobile 印刷体整行准确率反低于 v4），英文行加 en_PP-OCRv5_mobile_rec（85.25% vs 70.39%，7.5MB），按行内 CJK 占比路由
-- [ ] 加 cls 方向分类模型（~1.5MB），处理倒置 180° 扫描页
-- [ ] 长期：合成数据（程序生成仿真扫描表格图，自带标注）微调 rec 模型
+**第四组 · 模型升级（需 A/B 验证）（2026-08-21 调研+实测完毕）**
+- [x] ~~det 换 PP-OCRv5_mobile_det~~ → **A/B 否决**：慢 22%，唯一差异在印章区而印章已被像素抑制覆盖（见踩坑 37）
+- [x] ~~英文行加 en_PP-OCRv5_mobile_rec 路由~~ → **A/B 否决**：墨迹密度不可路由（中英重叠无阈值）；门控复跑 +9/-2 但收益场景下游已免疫（见踩坑 36）
+- [x] 加 cls 方向分类模型（PP-LCNet_x0_25，1.0MB），处理倒置 180° 扫描页（2026-08-21，见踩坑 40）
+- [ ] 长期：合成数据微调 rec → **评估结论**：当前 rec 在字段级（编号/日期/体重数字）置信度已 ≈1.0，残余误读无系统性模式；微调需 PaddlePaddle 训练环境 + 合成数据生成器 + 转换链（paddle2onnx 已验证可通），预计 2-3 天换 <5% 字符级收益，性价比低。触发条件：出现固定模式的系统性误读（某字体固定把 X 读成 Y）时，先试官方 server 级模型再考虑自训
 
 **明确不做的**：大模型路线（PaddleOCR-VL 等，浏览器跑不动且违反本地合规）；GLP 合规字段对齐/审计追踪（需求方明确只要"代替人工命名"）；GPU/WebGPU 加速与 rec 批量推理（2026-08-20 实测否定，见踩坑 20/21）。
 
@@ -142,7 +163,7 @@ bash rebuild.sh    # 完整构建：dist/ + dist-offline/（单文件离线版�
 - **快速自检**：引擎暴露 `window.__paddleRecognize` 钩子，可在控制台对 canvas 冒烟测试
 - **Python 复现管线**：可用 onnxruntime Python 版加载 assets-bin 里的模型离线复现 JS 管线（det→crop→rec），用于无浏览器调试
 - **输出 PDF 内容核对**（2026-08-19 实践）：工作区根目录有 `.venv-tools/`（已装 pymupdf），可把输出 PDF 渲染成 PNG 直接看页面内容——不确定某个输出文件是什么时，渲染出来看比猜 OCR 文本快得多
-- **纯逻辑离线断言**：见踩坑 18，extractTitle/extractArchiveRow/extractInfo 这类纯函数改动先在 node 下跑断言（当前 40 条，覆盖犬粘连串、猴/猪标签版式、合格证裸 No.、检测报告下一行取值等真实用例）
+- **纯逻辑离线断言**：见踩坑 18，extractTitle/extractArchiveRow/extractInfo 这类纯函数改动先在 node 下跑断言（当前 79 条，覆盖犬粘连串、猴/猪标签版式、合格证裸 No.、检测报告下一行取值等真实用例）
 - **推理层 A/B 验证**（2026-08-20 实践）：改 onnx 推理调用方式（批量/后端/参数）前，用 `.venv-tools` 里的 Python onnxruntime 加载 `assets-bin/rec.onnx`，对同一批真实裁片跑「现状 vs 新方案」对比解码结果（脚本方法：渲染一页 PDF → 随机取文字行裁片 → 两种调用各跑一遍 → 逐条比对文本）。数值级差异（字符翻转）肉眼看不出来，必须这样量化对比
 
 ## 8. 给接手 AI 的工作方式建议

@@ -6,6 +6,7 @@
  *   → { seq, cmd: 'init' }                                   预热引擎（加载模型）
  *   → { seq, cmd: 'open', docId, buf }                       打开文档（buf 为 transfer）
  *   → { seq, cmd: 'ocr', docId, pageIndex, hd? }             识别一页；hd=true 走顶部高清重试
+ *   → { seq, cmd: 'ocrIdCell', docId, pageIndex }            编号格放大重识别（顽固页三级重试）
  *   → { seq, cmd: 'close', docId }                           释放文档
  *   ← { seq, ok: true, pageCount? , lines?, height? } / { seq, ok: false, error }
  */
@@ -14,6 +15,8 @@ import {
   renderPage,
   renderTopRegion,
   recognizeCanvas,
+  textLayerLines,
+  ocrIdCell,
   type OpenedPdf,
   type OcrLine,
 } from './ocr'
@@ -22,7 +25,7 @@ import { setBinBytes, type BinBytes } from '../assets/binData'
 
 interface WorkerRequest {
   seq: number
-  cmd: 'init' | 'open' | 'ocr' | 'close'
+  cmd: 'init' | 'open' | 'ocr' | 'close' | 'ocrIdCell'
   docId?: string
   buf?: ArrayBuffer
   pageIndex?: number
@@ -65,11 +68,22 @@ async function handle(req: WorkerRequest): Promise<Partial<WorkerResponse>> {
     case 'ocr': {
       const opened = docs.get(req.docId!)
       if (!opened) throw new Error('文档未打开')
+      // 原生文字层直通：非扫描页免渲染免 OCR；文字太少判定为扫描件，走图像管线
+      if (!req.hd) {
+        const page = await opened.doc.getPage(req.pageIndex! + 1)
+        const tl = await textLayerLines(page)
+        if (tl) return { lines: tl.lines, height: tl.height }
+      }
       const canvas = req.hd
         ? await renderTopRegion(opened.doc, req.pageIndex!)
         : await renderPage(opened.doc, req.pageIndex!)
       const lines = await recognizeCanvas(canvas)
       return { lines, height: canvas.height }
+    }
+    case 'ocrIdCell': {
+      const opened = docs.get(req.docId!)
+      if (!opened) throw new Error('文档未打开')
+      return await ocrIdCell(opened.doc, req.pageIndex!)
     }
     case 'close': {
       const opened = docs.get(req.docId!)

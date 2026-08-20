@@ -9,11 +9,13 @@ import {
   extractArchiveRow,
   openPdfBuffer,
   renderPage,
+  renderNameTemplate,
 } from '@/lib/ocr'
 import { getOcrPool, autoPoolSize } from '@/lib/ocrPool'
+import { openPageCache } from '@/lib/pageCache'
 
 type Status = 'waiting' | 'working' | 'done' | 'failed'
-type NamingMode = 'id' | 'title_id' | 'title'
+type NamingMode = 'id' | 'title_id' | 'title' | 'template'
 type SplitMode = 'group' | 'page' | 'whole'
 
 interface PdfItem {
@@ -48,6 +50,8 @@ interface OutputFile {
   debug?: string[]
   /** 由几个同编号段合并而来（中英文对照合并） */
   mergedCount?: number
+  /** 中英文双版交叉验证差异（合并时检测），原样进 Excel 备注 */
+  extraNote?: string
 }
 
 interface HistoryEntry {
@@ -66,14 +70,65 @@ const HISTORY_KEY = 'pdf-rename-history'
 
 const ACCENT = '#0f766e'
 
-function makeName(mode: NamingMode, title?: string, animalId?: string, fallback = ''): string {
+function makeName(
+  mode: NamingMode,
+  title?: string,
+  animalId?: string,
+  fallback = '',
+  template = '{编号}',
+  source = ''
+): string {
   if (mode === 'id') return animalId || title || fallback
   if (mode === 'title_id') return title ? (animalId ? `${title}_${animalId}` : title) : animalId || fallback
+  if (mode === 'template') {
+    // 自定义模板：占位符缺值时渲染可能变空，回退到「编号/标题/原名」链
+    const v = renderNameTemplate(template, { id: animalId, title, source })
+    return v || animalId || title || fallback
+  }
   return title || fallback
 }
 
 /** 展示/下载用文件名：手动改名优先 */
 const dispName = (o: OutputFile) => o.customName ?? o.newName
+
+/**
+ * 中英文双版交叉验证：同编号合并组里，按 CJK 占比把各段 debug 分成中/英两组，
+ * 各自跑 extractArchiveRow，五字段（性别/出生日期/父母编号/最新体重）双边都有值却不一致 → 返回差异描述。
+ * 单边缺失不算冲突（那是「未识别」，已有 missing 通道报）。
+ */
+function crossCheckZhEn(g: OutputFile[]): string {
+  const zh: string[] = []
+  const en: string[] = []
+  for (const o of g) {
+    const pages = o.debug ?? []
+    const joined = pages.join('\n')
+    const cjk = (joined.match(/[一-鿿]/g) ?? []).length
+    const total = joined.replace(/\s/g, '').length || 1
+    ;(cjk / total >= 0.08 ? zh : en).push(...pages)
+  }
+  if (!zh.length || !en.length) return ''
+  const base = { animalId: g[0].animalId, sourceName: '', pageRange: '' }
+  const rz = extractArchiveRow({ ...base, debug: zh })
+  const re = extractArchiveRow({ ...base, debug: en })
+  // 日期归一化成 YYMMDD 数字串再比，防 12-29-25 vs 2025-12-29 格式差误报
+  const normDate = (s: string) => {
+    const m = s.match(/(\d{1,4})-(\d{1,2})-(\d{1,2})/)
+    if (!m) return s
+    const [a, b, c] = [m[1], m[2], m[3]]
+    const [y, mo, d] = a.length === 4 ? [+a % 100, +b, +c] : [+c % 100, +a, +b]
+    return `${y}${String(mo).padStart(2, '0')}${String(d).padStart(2, '0')}`
+  }
+  const diffs: string[] = []
+  const cmp = (label: string, a: string, b: string, norm: (s: string) => string = (s) => s) => {
+    if (a && b && norm(a) !== norm(b)) diffs.push(`${label}中${a}/英${b}`)
+  }
+  cmp('性别', rz.性别, re.性别)
+  cmp('出生日期', rz.出生日期, re.出生日期, normDate)
+  cmp('父亲编号', rz.父亲编号, re.父亲编号, (s) => s.replace(/\D/g, ''))
+  cmp('母亲编号', rz.母亲编号, re.母亲编号, (s) => s.replace(/\D/g, ''))
+  cmp('最新体重', rz['最新体重(kg)'], re['最新体重(kg)'], (s) => String(parseFloat(s)))
+  return diffs.length ? `中英字段不一致：${diffs.join('；')}` : ''
+}
 
 /** 结果在线预览：直接从内存里的拆分结果渲染页面，无需下载 */
 function PdfPreview({
@@ -150,6 +205,19 @@ export default function App() {
   const [running, setRunning] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const [namingMode, setNamingMode] = useState<NamingMode>('id')
+  // 自定义命名模板（localStorage 持久化）
+  const [nameTemplate, setNameTemplate] = useState(
+    () => localStorage.getItem('pdf-name-template') || '{编号}'
+  )
+  // 用户粘贴的编号清单（外部花名册）：小批次 <5 只时页面自举花名册失效，用它顶替
+  const [rosterText, setRosterText] = useState('')
+  const externalRoster = useMemo(() => {
+    const ids = rosterText
+      .split(/[\s,，、;；]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+    return ids.length ? [...new Set(ids)] : undefined
+  }, [rosterText])
   const [retryHd, setRetryHd] = useState(true)
   const [splitMode, setSplitMode] = useState<SplitMode>('group')
   const [mergeSameId, setMergeSameId] = useState(true)
@@ -204,6 +272,8 @@ export default function App() {
         }
         const bytes = await doc.save()
         const idx = result.indexOf(g[0])
+        // 中英文双版交叉验证：合并前几版字段互查，不一致的合并结果标待核对
+        const crossNote = crossCheckZhEn(g)
         result[idx] = {
           ...g[0],
           newName: g[0].animalId ?? g[0].newName, // 合并后统一用编号命名
@@ -213,7 +283,8 @@ export default function App() {
           guessed: g.some((o) => o.guessed),
           corrected: g.some((o) => o.corrected),
           lowConf: g.some((o) => o.lowConf),
-          suspect: g.some((o) => o.suspect),
+          suspect: g.some((o) => o.suspect) || !!crossNote,
+          extraNote: crossNote || undefined,
           bytes,
           mergedCount: g.length,
         }
@@ -340,6 +411,10 @@ export default function App() {
     const pool = getOcrPool()
     const docId = it.id
     const results: OutputFile[] = []
+    // 断点续跑：同一文件（按 文件名+大小+修改时间 识别）已完成页直接命中缓存
+    const cache = await openPageCache()
+    const fileKey = `${it.file.name}:${it.file.size}:${it.file.lastModified}`
+    const cachedPages = new Set<number>()
     try {
       const pageCount = await pool.openDoc(docId, buf)
       // 逐页识别：pool.size 条"跑道"并行派发，结果按页序落回数组
@@ -350,6 +425,19 @@ export default function App() {
       const runLane = async () => {
         while (next < pageCount && !stopRef.current) {
           const i = next++
+          // 缓存命中：整页 OCR 结果（含重试后的最终 info）直接复用
+          const hit = cache ? await cache.get(fileKey, i) : null
+          if (hit) {
+            cachedPages.add(i)
+            debugPages[i] = hit.debug
+            pages[i] = { ...hit.info }
+            done++
+            update(it.id, {
+              stage: `第 ${done}/${pageCount} 页（缓存）`,
+              progress: (done / pageCount) * 0.95 + 0.05,
+            })
+            continue
+          }
           try {
             const { lines, height } = await pool.ocrPage(docId, i)
             // 不截断：debug 文本同时是 extractArchiveRow 的输入，截断会丢掉靠后的称重行
@@ -361,7 +449,10 @@ export default function App() {
               idSource: info.idSource,
               idCandidates: info.idCandidates,
             }
+            // 逐页落盘：此刻中断，下次重开只补没跑完的页
+            cache?.put(fileKey, i, { debug: debugPages[i], info: pages[i] })
           } catch {
+            // 失败页不入缓存：可能是 Worker 瞬时错误，下次运行值得真重试
             debugPages[i] = `【第 ${i + 1} 页】（识别失败）`
             pages[i] = {}
           }
@@ -377,6 +468,7 @@ export default function App() {
       const retryIdx: number[] = []
       if (retryHd) {
         for (let i = 0; i < pages.length; i++) {
+          if (cachedPages.has(i)) continue // 缓存页已是含重试的最终结果，不再重试
           const p = pages[i]
           if (!p || !p.title || !/档案|记录/.test(p.title)) continue
           if (!p.animalId || p.idSource === 'pool' || p.idSource === 'fallback') retryIdx.push(i)
@@ -398,14 +490,34 @@ export default function App() {
               p.idSource = info.idSource
             }
             p.idCandidates = [...(p.idCandidates ?? []), ...info.idCandidates]
+            // 仍无编号：三级重试——编号格裁剪放大 2.5× 再认（小字/章压字的顽固页）
+            if (!p.animalId) {
+              try {
+                const cell = await pool.ocrIdCell(docId, i)
+                if (cell.lines.length > 0) {
+                  const ci = extractInfo(cell.lines, cell.height)
+                  if (ci.animalId) {
+                    p.animalId = ci.animalId
+                    p.idSource = ci.idSource
+                    debugPages[i] +=
+                      '\n—— 编号格放大重试 ——\n' + cell.lines.map((l) => l.text).join('\n')
+                  }
+                }
+              } catch {
+                /* 三级重试失败维持原结果 */
+              }
+            }
           } catch {
             /* 重试失败维持原结果，交给花名册推定 */
           }
+          // 重试后页状态变了（编号/候选/debug 追加），更新缓存为最终态
+          cache?.put(fileKey, i, { debug: debugPages[i], info: pages[i] })
         }
       }
       await Promise.all(Array.from({ length: pool.size }, runRetry))
+      cache?.touch(fileKey, pageCount)
       // 文档级修正：合集带检测表（编号清单）时，纠错/推定各页编号
-      if (splitMode !== 'page') applyRoster(pages)
+      if (splitMode !== 'page') applyRoster(pages, externalRoster)
       // 拆分
       const srcDoc = await PDFDocument.load(buf, { ignoreEncryption: true })
       const segs =
@@ -427,7 +539,7 @@ export default function App() {
         const name =
           !aid && first.title && /档案|记录/.test(first.title)
             ? fallback
-            : makeName(namingMode, first.title, aid, fallback)
+            : makeName(namingMode, first.title, aid, fallback, nameTemplate, it.origName)
         const outDoc = await PDFDocument.create()
         const copied = await outDoc.copyPages(
           srcDoc,
@@ -647,6 +759,7 @@ export default function App() {
                 ['id', '只用编号', 'B265003'],
                 ['title_id', '标题_编号', '实验猪个体档案_B265003'],
                 ['title', '只用标题', '实验猪个体档案'],
+                ['template', '自定义模板', ''],
               ] as [NamingMode, string, string][]
             ).map(([mode, label, example]) => (
               <label key={mode} className="flex cursor-pointer items-center gap-1.5">
@@ -658,9 +771,23 @@ export default function App() {
                   className="accent-[#0f766e]"
                 />
                 <span>{label}</span>
-                <span className="font-mono text-xs text-[#9a958a]">{example}</span>
+                {example && <span className="font-mono text-xs text-[#9a958a]">{example}</span>}
               </label>
             ))}
+            {namingMode === 'template' && (
+              <span className="flex items-center gap-1.5">
+                <input
+                  value={nameTemplate}
+                  onChange={(e) => {
+                    setNameTemplate(e.target.value)
+                    localStorage.setItem('pdf-name-template', e.target.value)
+                  }}
+                  placeholder="{编号}_{标题}"
+                  className="w-44 border border-[#c9c5b8] bg-white/60 px-2 py-1 font-mono text-xs outline-none focus:border-[#0f766e]"
+                />
+                <span className="text-xs text-[#9a958a]">可用 {'{编号}'} {'{标题}'} {'{来源}'}</span>
+              </span>
+            )}
           </div>
           <label className="flex cursor-pointer items-center gap-1.5">
             <input
@@ -683,6 +810,24 @@ export default function App() {
             <span>模糊页高清重试</span>
             <span className="text-xs text-[#9a958a]">认不出编号的页放大再试一次，更准但更慢；赶时间可关掉</span>
           </label>
+          <details className="text-sm">
+            <summary className="cursor-pointer select-none text-[#6b675c]">
+              粘贴编号清单（可选）
+              <span className="ml-1 text-xs text-[#9a958a]">
+                小批次（&lt;5 只）花名册无法自动生成时，粘贴清单后按它纠错/推定编号
+              </span>
+            </summary>
+            <textarea
+              value={rosterText}
+              onChange={(e) => setRosterText(e.target.value)}
+              rows={3}
+              placeholder={'每行一个编号，或用空格/逗号分隔，如：\n7050001\n7050002\n7050003'}
+              className="mt-2 w-full border border-[#c9c5b8] bg-white/60 px-2 py-1.5 font-mono text-xs outline-none focus:border-[#0f766e]"
+            />
+            {externalRoster && (
+              <p className="mt-1 text-xs text-[#0f766e]">已载入 {externalRoster.length} 个编号，将用于本批纠错与顺序推定</p>
+            )}
+          </details>
         </div>
 
         {/* 操作栏 */}
@@ -900,6 +1045,11 @@ export default function App() {
                       {o.mergedCount && o.mergedCount > 1 && (
                         <span className="ml-1 bg-[#0f766e]/10 px-1.5 py-0.5 text-[#0f766e]">
                           {o.mergedCount} 个来源合并
+                        </span>
+                      )}
+                      {o.extraNote && (
+                        <span className="ml-1 bg-[#b91c1c]/10 px-1.5 py-0.5 text-[#b91c1c]">
+                          {o.extraNote}
                         </span>
                       )}
                       {o.title ? ` · ${o.title}` : ''}

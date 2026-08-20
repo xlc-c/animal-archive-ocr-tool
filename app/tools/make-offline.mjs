@@ -70,6 +70,11 @@ await w('<script>window.__BIN__={det:"')
 await writeB64(path.join(binDir, 'det.onnx'))
 await w('",rec:"')
 await writeB64(path.join(binDir, 'rec.onnx'))
+// cls 方向分类模型（180° 倒置页检测）：文件存在才注入，老构建目录没有它也能出包
+if (fs.existsSync(path.join(binDir, 'cls.onnx'))) {
+  await w('",cls:"')
+  await writeB64(path.join(binDir, 'cls.onnx'))
+}
 await w('",wasm:"')
 await writeB64(path.join(binDir, 'ort.wasm'))
 await w('",dict:')

@@ -8,13 +8,16 @@ import * as ort from 'onnxruntime-web/wasm'
 // emscripten 工厂模块源码：file:// 下动态 import 被浏览器拦截，
 // 以 blob URL 形式提供给 ort（blob 模块脚本不受 file:// 限制）
 import factoryMjs from '../assets/ort-factory.mjs?raw'
-import { DET_B64, REC_B64, WASM_B64, DICT_TEXT, getBinBytes } from '../assets/binData'
+import { DET_B64, REC_B64, WASM_B64, DICT_TEXT, CLS_B64, getBinBytes } from '../assets/binData'
 import { classifySexGlyph } from './sexGlyph'
+import { ctcDecode } from './ctc'
 
 export interface OcrLine {
   text: string
   confidence: number
   bbox: { x0: number; y0: number; x1: number; y1: number }
+  /** CTC top-2 单字符替换候选（仅编号形态的行挂载），供花名册组合纠错 */
+  alts?: string[]
 }
 
 /** Worker 里没有 document，用 OffscreenCanvas；主线程用普通 canvas */
@@ -86,6 +89,8 @@ const REC_MAX_W = 2400
 interface Engine {
   det: ort.InferenceSession
   rec: ort.InferenceSession
+  /** 方向分类（0°/180°），模型缺失时为 null（倒置检测自动跳过） */
+  cls: ort.InferenceSession | null
   keys: string[]
 }
 
@@ -145,7 +150,20 @@ export function initEngine(
       const dictText =
         injected?.dict || DICT_TEXT || (await (await fetch(assetUrl('models/dict.txt'))).text())
       const keys = dictText.split(/\r?\n/).filter((s, i, a) => i < a.length - 1 || s.length > 0)
-      return { det, rec, keys }
+      // cls 方向分类（180° 倒置页检测）：任何一环拿不到就降级为 null，不影响主流程
+      onProgress?.('加载方向分类模型', 0.8)
+      let clsBuf: ArrayBuffer | null = null
+      try {
+        clsBuf = injected?.cls
+          ? injected.cls
+          : CLS_B64
+            ? (b64ToBytes(CLS_B64).buffer as ArrayBuffer)
+            : await fetchCached(assetUrl('models/cls.onnx'))
+      } catch {
+        clsBuf = null
+      }
+      const cls = clsBuf ? await createSession(clsBuf) : null
+      return { det, rec, cls, keys }
     })()
     enginePromise.catch(() => {
       enginePromise = null // 失败后允许重试
@@ -258,38 +276,7 @@ function extractBoxes(prob: Float32Array, w: number, h: number): Box[] {
 }
 
 // ── CTC 解码 ────────────────────────────────────────────────────────
-
-function ctcDecode(probs: Float32Array, t: number, dims: number, keys: string[]) {
-  const idxs: number[] = []
-  let prev = -1
-  let confSum = 0
-  let confCnt = 0
-  for (let i = 0; i < t; i++) {
-    let best = 0
-    let bestP = 0
-    const off = i * dims
-    for (let j = 0; j < dims; j++) {
-      const p = probs[off + j]
-      if (p > bestP) { bestP = p; best = j }
-    }
-    if (best !== 0 && best !== prev) {
-      idxs.push(best)
-      confSum += bestP
-      confCnt++
-    } else if (best !== 0) {
-      confSum += bestP
-      confCnt++
-    }
-    prev = best
-  }
-  let text = ''
-  for (const idx of idxs) {
-    // dict.txt 首行是 'blank' 占位，idx 直接对应 keys[idx]（idx0=blank 已在上面滤掉）
-    if (idx >= 1 && idx < keys.length && keys[idx] !== 'blank') text += keys[idx]
-    // 末尾空格 token 上层会去掉所有空白，这里忽略
-  }
-  return { text, confidence: confCnt > 0 ? confSum / confCnt : 0 }
-}
+// 实现已抽到 ./ctc（纯函数，便于离线断言 harness 直测）
 
 /**
  * 乱码行判定：表格线/底纹被误检后 rec 会输出重复生僻字（如「涵涵厅涵」「éééé」）。
@@ -315,6 +302,103 @@ function isGarbageLine(text: string, conf: number): boolean {
 
 // ── 主流程 ──────────────────────────────────────────────────────────
 
+interface Rect {
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
+/** det 检测 + 坐标映射回原图 + 尺寸过滤，返回原图尺度的有效裁片矩形（排序同 extractBoxes） */
+async function detectRects(engine: Engine, page: AnyCanvas): Promise<Rect[]> {
+  const { data, w, h } = detPreprocess(page)
+  const detOut = await engine.det.run({
+    x: new ort.Tensor('float32', data, [1, 3, h, w]),
+  })
+  const prob = detOut[Object.keys(detOut)[0]].data as Float32Array
+  const boxes = extractBoxes(prob, w, h)
+  const sx = page.width / w
+  const sy = page.height / h
+  const rects: Rect[] = []
+  for (const b of boxes) {
+    // 外扩白边：rec 训练样本带 padding，贴边裁剪会掉准确率
+    const padX = (b.x1 - b.x0) * 0.04
+    const padY = (b.y1 - b.y0) * 0.12
+    const rx0 = Math.max(0, Math.round((b.x0 - padX) * sx))
+    const ry0 = Math.max(0, Math.round((b.y0 - padY) * sy))
+    const rx1 = Math.min(page.width, Math.round((b.x1 + padX) * sx))
+    const ry1 = Math.min(page.height, Math.round((b.y1 + padY) * sy))
+    const rw = rx1 - rx0
+    const rh = ry1 - ry0
+    if (rw < 6 || rh < 6) continue
+    // 表格线残渣：原图尺度的细条直接跳过（文字行在 300dpi 渲染下 ≥20px 高，表格线框只有几像素）
+    if (rh < 20 && rw / rh > 4) continue // 横线
+    if (rw < 20 && rh / rw > 4) continue // 竖线
+    rects.push({ x0: rx0, y0: ry0, x1: rx1, y1: ry1 })
+  }
+  return rects
+}
+
+/** 整页 180° 旋转（倒置扫描页自救） */
+function rotate180(src: AnyCanvas): AnyCanvas {
+  const c = makeCanvas(src.width, src.height)
+  const ctx = c.getContext('2d')!
+  ctx.translate(src.width, src.height)
+  ctx.rotate(Math.PI)
+  ctx.drawImage(src, 0, 0)
+  return c
+}
+
+/**
+ * cls 行级投票判倒置：取最高的若干行裁片跑方向分类（文字行比碎片高，判定最稳），
+ * 多数判 180°（置信 >0.9）→ 整页视为倒置扫描件。正常页开销 ≤8 次 ~1ms 推理，可忽略。
+ */
+async function voteInverted(engine: Engine, page: AnyCanvas, rects: Rect[]): Promise<boolean> {
+  if (!engine.cls || rects.length < 3) return false
+  const sample = [...rects].sort((a, b) => b.y1 - b.y0 - (a.y1 - a.y0)).slice(0, 8)
+  if (sample.length < 3) return false
+  let votes = 0
+  for (const r of sample) {
+    const rw = r.x1 - r.x0
+    const rh = r.y1 - r.y0
+    // RapidOCR 预处理：保宽高比缩放到 H=80，右侧补零（[-1,1] 归一化空间的 0 ≈ 中灰）到 W=160
+    const cw = Math.min(160, Math.max(8, Math.round((80 * rw) / rh)))
+    const crop = makeCanvas(160, 80)
+    const cctx = crop.getContext('2d')!
+    cctx.fillStyle = '#808080'
+    cctx.fillRect(0, 0, 160, 80)
+    cctx.drawImage(page, r.x0, r.y0, rw, rh, 0, 0, cw, 80)
+    const { data } = canvasToCHW(crop, (v) => (v / 255 - 0.5) / 0.5)
+    const out = await engine.cls.run({ x: new ort.Tensor('float32', data, [1, 3, 80, 160]) })
+    const p = out[Object.keys(out)[0]].data as Float32Array
+    if (p[1] > 0.9 && p[1] > p[0]) votes++
+  }
+  return votes >= 3 && votes * 2 > sample.length
+}
+
+/**
+ * 红色印章抑制：档案页几乎页页盖章，红章压字处 rec 常读错（如编号被章环文污染）。
+ * 把饱和红像素（r 明显大于 g/b）提升为白；黑/蓝/灰色文字与表格不受影响。
+ * 阈值保守：只动高饱和红，暗红/棕色字迹（g/b 也低但整体暗）不满足 r>130 会被保留。
+ */
+function suppressRedSeal(src: AnyCanvas): AnyCanvas {
+  const w = src.width
+  const h = src.height
+  const copy = makeCanvas(w, h)
+  const ctx = copy.getContext('2d')!
+  ctx.drawImage(src, 0, 0)
+  const img = ctx.getImageData(0, 0, w, h)
+  const d = img.data
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i]
+    if (r > 130 && r - d[i + 1] > 45 && r - d[i + 2] > 45) {
+      d[i] = d[i + 1] = d[i + 2] = 255
+    }
+  }
+  ctx.putImageData(img, 0, 0)
+  return copy
+}
+
 /**
  * 对 canvas 做 OCR（检测 + 识别），返回带坐标的行。
  * 接口与旧 tesseract 版 recognizeCanvas 完全一致。
@@ -329,55 +413,50 @@ export async function recognizeCanvasPaddle(
   onProgress?: (status: string, progress: number) => void
 ): Promise<OcrLine[]> {
   const engine = await initEngine(onProgress)
-  // 1) 检测
-  const { data, w, h } = detPreprocess(src)
-  const detOut = await engine.det.run({
-    x: new ort.Tensor('float32', data, [1, 3, h, w]),
-  })
-  const prob = detOut[Object.keys(detOut)[0]].data as Float32Array
-  const boxes = extractBoxes(prob, w, h)
-  // 坐标映射回原图
-  const sx = src.width / w
-  const sy = src.height / h
+  // 红色印章抑制（黑/蓝文字不受影响），det 与 rec 裁片统一用处理后的图
+  let work = suppressRedSeal(src)
+  // 1) 检测（180° 倒置扫描页：cls 投票命中则整页旋转后重跑检测）
+  let allRects = await detectRects(engine, work)
+  if (await voteInverted(engine, work, allRects)) {
+    work = rotate180(work)
+    allRects = await detectRects(engine, work)
+  }
   const lines: OcrLine[] = []
-  // 所有通过尺寸过滤的 det 框（含 rec 读空的）——性别符号格补救要用
-  const allRects: Array<{ x0: number; y0: number; x1: number; y1: number }> = []
   // 2) 逐行识别
-  for (const b of boxes) {
-    // 外扩 8% 白边：rec 训练样本带 padding，贴边裁剪会掉准确率
-    const padX = (b.x1 - b.x0) * 0.04
-    const padY = (b.y1 - b.y0) * 0.12
-    const rx0 = Math.max(0, Math.round((b.x0 - padX) * sx))
-    const ry0 = Math.max(0, Math.round((b.y0 - padY) * sy))
-    const rx1 = Math.min(src.width, Math.round((b.x1 + padX) * sx))
-    const ry1 = Math.min(src.height, Math.round((b.y1 + padY) * sy))
-    const rw = Math.max(1, rx1 - rx0)
-    const rh = Math.max(1, ry1 - ry0)
-    if (rw < 6 || rh < 6) continue
-    // 表格线残渣：原图尺度的细条直接跳过（文字行在 300dpi 渲染下 ≥20px 高，表格线框只有几像素）
-    if (rh < 20 && rw / rh > 4) continue // 横线
-    if (rw < 20 && rh / rw > 4) continue // 竖线
-    allRects.push({ x0: rx0, y0: ry0, x1: rx1, y1: ry1 })
+  for (const r of allRects) {
+    const rx0 = r.x0
+    const ry0 = r.y0
+    const rw = r.x1 - r.x0
+    const rh = r.y1 - r.y0
     const crop = makeCanvas(Math.min(REC_MAX_W, Math.max(8, Math.round((REC_IMG_H * rw) / rh))), REC_IMG_H)
     const outW = crop.width
     const cctx = crop.getContext('2d')!
     cctx.fillStyle = '#ffffff'
     cctx.fillRect(0, 0, outW, REC_IMG_H)
-    cctx.drawImage(src, rx0, ry0, rw, rh, 0, 0, outW, REC_IMG_H)
+    cctx.drawImage(work, rx0, ry0, rw, rh, 0, 0, outW, REC_IMG_H)
     const { data: recData } = canvasToCHW(crop, (v) => (v / 255 - 0.5) / 0.5)
     const recOut = await engine.rec.run({
       x: new ort.Tensor('float32', recData, [1, 3, REC_IMG_H, outW]),
     })
     const t0 = recOut[Object.keys(recOut)[0]]
     const [_, t, dims] = t0.dims as unknown as [number, number, number]
-    const { text, confidence } = ctcDecode(t0.data as Float32Array, t, dims, engine.keys)
+    const { text, confidence, alts } = ctcDecode(t0.data as Float32Array, t, dims, engine.keys)
     const clean = text.replace(/\s+/g, '')
     if (!clean) continue
     if (isGarbageLine(clean, confidence)) continue
+    // CTC top-2 候选只给编号形态的行挂载（控制 Worker→主线程传输量）；
+    // 中文行/长文本行的 alt 没有纠错价值
+    const altClean =
+      /\d/.test(clean) && /^[A-Z0-9][-A-Z0-9]{3,}$/i.test(clean)
+        ? alts
+            .map((a) => a.replace(/\s+/g, ''))
+            .filter((a) => a && a !== clean)
+        : []
     lines.push({
       text: clean,
       confidence: confidence * 100, // 对齐 tesseract 的 0~100 置信度
       bbox: { x0: rx0, y0: ry0, x1: rx0 + rw, y1: ry0 + rh },
+      ...(altClean.length ? { alts: altClean.slice(0, 2) } : {}),
     })
   }
   // ♀/♂ 性别格补救：rec 字典没有这两个符号（实测 8 页猪档案：7 页整格读空、1 页误读「早」），
@@ -408,7 +487,7 @@ export async function recognizeCanvasPaddle(
         const ch = cell.y1 - cell.y0
         const cellCanvas = makeCanvas(cw, ch)
         const cctx2 = cellCanvas.getContext('2d')!
-        cctx2.drawImage(src, cell.x0, cell.y0, cw, ch, 0, 0, cw, ch)
+        cctx2.drawImage(work, cell.x0, cell.y0, cw, ch, 0, 0, cw, ch)
         const sym = classifySexGlyph(cctx2.getImageData(0, 0, cw, ch).data, cw, ch)
         if (sym) {
           if (existIdx >= 0) {

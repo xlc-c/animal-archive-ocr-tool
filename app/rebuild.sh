@@ -22,6 +22,8 @@ rm -rf $BUILD/src $BUILD/public
 cp -r $SRC/src $BUILD/src
 [ -d $SRC/public ] && cp -r $SRC/public $BUILD/public || true
 cp $SRC/index.html $SRC/package.json $SRC/package-lock.json $SRC/tsconfig*.json $SRC/vite.config.ts $SRC/tailwind.config.js $SRC/postcss.config.js $BUILD/
+# tools 也要先清再拷：cp -r 到已存在的同名目录会嵌套成 tools/tools，旧脚本残留导致打包逻辑悄悄过期
+rm -rf $BUILD/tools
 [ -d $SRC/tools ] && cp -r $SRC/tools $BUILD/tools || true
 if [ ! -d $BUILD/node_modules ]; then
   # 首次构建：复制本地 node_modules（老平台用的是模板目录，本机直接用项目自己的）

@@ -141,6 +141,101 @@ export async function renderTopRegion(
   return crop
 }
 
+/**
+ * PDF 原生文字层直通：非扫描页（电子单据/原生 PDF）直接取文字层，免渲染免 OCR。
+ * 返回 null 表示文字层内容太少（判定为扫描件），调用方回退图像 OCR 管线。
+ * bbox 转成与渲染 canvas 一致的自上而下坐标，下游 extractInfo/extractArchiveRow 无感。
+ */
+export async function textLayerLines(
+  page: pdfjs.PDFPageProxy
+): Promise<{ lines: OcrLine[]; height: number } | null> {
+  const tc = await page.getTextContent()
+  interface TextItem {
+    str: string
+    transform: number[]
+    width: number
+    height: number
+  }
+  const items = (tc.items as TextItem[]).filter((it) => it.str.trim())
+  const totalChars = items.reduce((s, it) => s + it.str.trim().length, 0)
+  if (totalChars < 30) return null // 扫描件或只有页眉页脚水印文字
+  const vp = page.getViewport({ scale: 1 })
+  // 按基线排序，同一视觉行的片段合并成一行（文字层 item 常是一个个碎片）
+  const rows = items
+    .map((it) => {
+      const x = it.transform[4]
+      const yBottom = it.transform[5]
+      const h = it.height || Math.abs(it.transform[3]) || 10
+      return {
+        str: it.str,
+        x0: x,
+        y0: vp.height - yBottom - h,
+        x1: x + it.width,
+        y1: vp.height - yBottom,
+        h,
+      }
+    })
+    .sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0)
+  const lines: OcrLine[] = []
+  for (const r of rows) {
+    const last = lines[lines.length - 1]
+    if (last && Math.abs(last.bbox.y0 - r.y0) < r.h * 0.5 && r.x0 - last.bbox.x1 < r.h * 2) {
+      last.text += ' ' + r.str // 空格保持 token 边界，防止粘连误读
+      last.bbox.x1 = Math.max(last.bbox.x1, r.x1)
+      last.bbox.y0 = Math.min(last.bbox.y0, r.y0)
+      last.bbox.y1 = Math.max(last.bbox.y1, r.y1)
+    } else {
+      lines.push({
+        text: r.str,
+        confidence: 1,
+        bbox: { x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 },
+      })
+    }
+  }
+  return { lines, height: vp.height }
+}
+
+/**
+ * 编号格放大重识别：顶部高清渲染后定位编号标签行，把「标签右侧带」和「标签下方带」
+ * 裁出放大 2.5 倍再认一次。用于整页+高清重试都认不出编号的顽固页（小字/盖章压字）。
+ */
+const ID_CELL_LABEL = /耳号|耳标|纹身|Tattoo|Ear\s?Tag|猴\s*号|动物\s*编号|芯片\s*号|犬\s*号|原猴/i
+export async function ocrIdCell(
+  doc: pdfjs.PDFDocumentProxy,
+  pageIndex: number
+): Promise<{ lines: OcrLine[]; height: number }> {
+  const top = await renderTopRegion(doc, pageIndex)
+  const lines = await recognizeCanvas(top)
+  const lab = lines.find((l) => ID_CELL_LABEL.test(l.text))
+  if (!lab) return { lines: [], height: top.height }
+  const h = lab.bbox.y1 - lab.bbox.y0
+  const cy = (lab.bbox.y0 + lab.bbox.y1) / 2
+  // 右带（标签-值同行版式：猪/猴/接收档案）+ 下带（英文表格列头版式：值在列头下方）
+  const regions = [
+    {
+      x0: Math.min(top.width - 8, lab.bbox.x1 + 5),
+      y0: Math.max(0, cy - h * 1.3),
+      x1: top.width,
+      y1: Math.min(top.height, cy + h * 1.3),
+    },
+    { x0: 0, y0: lab.bbox.y1, x1: top.width, y1: Math.min(top.height, lab.bbox.y1 + h * 3.5) },
+  ]
+  const out: OcrLine[] = []
+  for (const rg of regions) {
+    const rw = Math.round(rg.x1 - rg.x0)
+    const rh = Math.round(rg.y1 - rg.y0)
+    if (rw < 20 || rh < 10) continue
+    const zoom = 2.5
+    const cell = makeCanvas(Math.round(rw * zoom), Math.round(rh * zoom))
+    const cctx = cell.getContext('2d')!
+    cctx.fillStyle = '#ffffff'
+    cctx.fillRect(0, 0, cell.width, cell.height)
+    cctx.drawImage(top, rg.x0, rg.y0, rw, rh, 0, 0, cell.width, cell.height)
+    out.push(...(await recognizeCanvas(cell)))
+  }
+  return { lines: out, height: top.height }
+}
+
 /** 对 canvas 做 OCR，返回带坐标的行（PaddleOCR PP-OCRv4 mobile 引擎） */
 export async function recognizeCanvas(
   canvas: AnyCanvas,
@@ -542,6 +637,14 @@ export function extractInfo(
     const v = tokenFromText(l.text, true)
     if (v && !idCandidates.includes(v)) idCandidates.push(v)
   }
+  // CTC top-2 候选（编号行的次优解码路径）一并入册：
+  // top-1 误读但 top-2 命中花名册时，applyRoster 的组合纠错能救回来
+  for (const l of lines) {
+    for (const a of l.alts ?? []) {
+      const v = tokenFromText(a, true)
+      if (v && !idCandidates.includes(v)) idCandidates.push(v)
+    }
+  }
   return { title, species, animalId, idSource, idCandidates }
 }
 
@@ -621,9 +724,13 @@ function fuzzyMatch(id: string, roster: string[]): string | null {
 /**
  * 文档级修正。直接修改 pages：
  * - animalId 被纠错 / 丢弃 / 顺序推定（guessed=true）
+ * - externalRoster：用户在页面上粘贴的编号清单。小批次（<5 只）花名册无法从
+ *   页面自举（buildRoster 需 ≥5 个同簇编号），外部清单直接顶替花名册参与纠错/推定
  */
-export function applyRoster(pages: RosterPage[]): void {
-  const roster = buildRoster(pages)
+export function applyRoster(pages: RosterPage[], externalRoster?: string[]): void {
+  const roster = externalRoster?.length
+    ? [...new Set(externalRoster.map((s) => s.toUpperCase()))]
+    : buildRoster(pages)
   if (roster.length === 0) return
   const inRoster = (id?: string) => !!id && roster.includes(id.toUpperCase())
   // 0) 花名册清单页检测：候选编号里命中花名册 ≥3 个的页（寄宿费清单/订购单/总清单等），
@@ -647,7 +754,24 @@ export function applyRoster(pages: RosterPage[]): void {
     if (fixed) {
       p.animalId = fixed // 能对上花名册 → 用标准动物编号
       p.corrected = true // 标记纠错，结果列表高亮提示人工核对
-    } else if (/^No\./i.test(p.animalId)) {
+      continue
+    }
+    // CTC top-k × 花名册组合纠错：top-1 误读超编辑距离阈值（或双向都近、判不出唯一）时，
+    // 候选池（含 top-2 alt）里若有且仅有一个精确命中花名册的编号 → 采用，标 corrected。
+    // 限定唯一命中防误救（命中 ≥2 个说明是清单页或串号，不动）。
+    if (!/^No\./i.test(p.animalId)) {
+      const hits = [
+        ...new Set(
+          (p.idCandidates ?? []).map((c) => c.toUpperCase()).filter((c) => rosterSet.has(c))
+        ),
+      ]
+      if (hits.length === 1) {
+        p.animalId = hits[0]
+        p.corrected = true
+        continue
+      }
+    }
+    if (/^No\./i.test(p.animalId)) {
       continue // 合格证/发票等单据编号：本来就不在花名册里，保留
     } else if (p.idSource === 'pool' || p.idSource === 'fallback') {
       p.animalId = undefined // 低可信来源对不上花名册，按未识别处理
@@ -689,6 +813,24 @@ export function dedupeNames(items: { newName: string }[]): void {
   }
 }
 
+/**
+ * 自定义命名模板渲染：支持 {编号} {标题} {来源} 占位符。
+ * 缺值的占位符渲染为空并收拢由此产生的分隔符；文件名非法字符剔除。渲染为空时返回 '' 由调用方兜底。
+ */
+export function renderNameTemplate(
+  tpl: string,
+  fields: { id?: string; title?: string; source?: string }
+): string {
+  return tpl
+    .replace(/\{编号\}/g, fields.id ?? '')
+    .replace(/\{标题\}/g, fields.title ?? '')
+    .replace(/\{来源\}/g, fields.source ?? '')
+    .replace(/[\\/:*?"<>|]/g, '')
+    .replace(/_{2,}/g, '_')
+    .replace(/^[_\s-]+|[_\s-]+$/g, '')
+    .trim()
+}
+
 // ── Excel 档案汇总表字段提取 ─────────────────────────────────────────
 
 /** extractArchiveRow 的输入（段内 OCR 文本 + 命名信息） */
@@ -700,6 +842,8 @@ export interface ArchiveRowInput {
   guessed?: boolean
   corrected?: boolean
   mergedCount?: number
+  /** 额外备注（如中英文双版交叉验证差异），原样并入「备注」列 */
+  extraNote?: string
 }
 
 /**
@@ -887,6 +1031,7 @@ export function extractArchiveRow(o: ArchiveRowInput) {
       o.guessed ? '编号为顺序推定' : '',
       o.corrected ? '编号经花名册纠错' : '',
       o.mergedCount ? `合并${o.mergedCount}个来源` : '',
+      o.extraNote ?? '',
       ...missing,
     ]
       .filter(Boolean)
