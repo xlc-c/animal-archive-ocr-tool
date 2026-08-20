@@ -6,7 +6,7 @@
 
 ## 使用
 
-从 [Releases](../../releases) 下载 `动物档案OCR工具.html`，双击打开（推荐 Edge/Chrome），拖入 PDF 即可。
+从 [Releases](../../releases) 下载 `animal-archive-ocr.html`，双击打开（推荐 Edge/Chrome），拖入 PDF 即可。
 
 - 支持整本多页合集、多文件批处理
 - 按动物编号自动分段拆分，同编号连续页合并，中英文档案自动配对合并
