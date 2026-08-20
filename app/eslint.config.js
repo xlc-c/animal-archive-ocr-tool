@@ -20,4 +20,12 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
+  {
+    // shadcn/ui 官方组件：变体常量（buttonVariants 等）与组件同文件导出是其标准写法，
+    // 仅为满足 fast-refresh 而拆文件会增加维护成本，此目录关闭该规则
+    files: ['src/components/ui/**/*.{ts,tsx}'],
+    rules: {
+      'react-refresh/only-export-components': 'off',
+    },
+  },
 ])

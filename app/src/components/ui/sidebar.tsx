@@ -607,9 +607,13 @@ function SidebarMenuSkeleton({
   showIcon?: boolean
 }) {
   // Random width between 50 to 90%.
+  // 用 useId 派生确定性的伪随机宽度：渲染期调用 Math.random 违反组件纯度规则
+  const reactId = React.useId()
   const width = React.useMemo(() => {
-    return `${Math.floor(Math.random() * 40) + 50}%`
-  }, [])
+    let h = 0
+    for (let i = 0; i < reactId.length; i++) h = (h * 31 + reactId.charCodeAt(i)) >>> 0
+    return `${(h % 40) + 50}%`
+  }, [reactId])
 
   return (
     <div

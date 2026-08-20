@@ -39,6 +39,8 @@ interface OutputFile {
   guessed?: boolean
   /** 编号被花名册纠错改过，需人工核对 */
   corrected?: boolean
+  /** 编号自证充分但不在花名册里（名册页漏读），需人工核对 */
+  offRoster?: boolean
   /** 编号来自低可信候选池（pool），需人工核对 */
   lowConf?: boolean
   /** 可疑项（推定/纠错/低可信/未识别），结果列表高亮置顶 */
@@ -193,9 +195,15 @@ interface PageInfo {
   animalId?: string
   idSource?: 'label' | 'filename' | 'pool' | 'fallback' | null
   idCandidates?: string[]
+  /** 次级标签候选编号（如猴档案序号 027）——top-k 救援交叉验证用 */
+  idAlts?: string[]
+  /** 编号在页内 OCR 行中出现次数（≥2 = 编号格+水印双现自证），防花名册误纠 */
+  idEvidence?: number
   guessed?: boolean
   /** 编号被花名册纠错改过 */
   corrected?: boolean
+  /** 编号自证充分但不在花名册里（名册页漏读），需人工核对 */
+  offRoster?: boolean
   rosterPage?: boolean // 花名册清单页（一页命中 ≥3 个花名册编号），强制独立成段
 }
 
@@ -282,6 +290,7 @@ export default function App() {
           debug: g.flatMap((o) => o.debug ?? []),
           guessed: g.some((o) => o.guessed),
           corrected: g.some((o) => o.corrected),
+          offRoster: g.some((o) => o.offRoster),
           lowConf: g.some((o) => o.lowConf),
           suspect: g.some((o) => o.suspect) || !!crossNote,
           extraNote: crossNote || undefined,
@@ -447,6 +456,8 @@ export default function App() {
               title: info.title ?? undefined,
               animalId: info.animalId ?? undefined,
               idSource: info.idSource,
+              idEvidence: info.idEvidence,
+              idAlts: info.idAlts,
               idCandidates: info.idCandidates,
             }
             // 逐页落盘：此刻中断，下次重开只补没跑完的页
@@ -488,8 +499,11 @@ export default function App() {
             if (info.animalId && (info.idSource === 'label' || !p.animalId)) {
               p.animalId = info.animalId
               p.idSource = info.idSource
+              p.idEvidence = info.idEvidence
+              p.idAlts = info.idAlts
             }
             p.idCandidates = [...(p.idCandidates ?? []), ...info.idCandidates]
+            p.idAlts = [...new Set([...(p.idAlts ?? []), ...info.idAlts])]
             // 仍无编号：三级重试——编号格裁剪放大 2.5× 再认（小字/章压字的顽固页）
             if (!p.animalId) {
               try {
@@ -499,6 +513,8 @@ export default function App() {
                   if (ci.animalId) {
                     p.animalId = ci.animalId
                     p.idSource = ci.idSource
+                    p.idEvidence = ci.idEvidence
+                    p.idAlts = ci.idAlts
                     debugPages[i] +=
                       '\n—— 编号格放大重试 ——\n' + cell.lines.map((l) => l.text).join('\n')
                   }
@@ -529,10 +545,11 @@ export default function App() {
         const first = segPages.find((p) => p.animalId || p.title) ?? {}
         const aid = seg.id ?? first.animalId
         const guessed = segPages.some((p) => p.animalId === aid && p.guessed)
-        // 可疑项判定：顺序推定 / 花名册纠错 / 编号来自低可信候选池 / 未识别出编号
+        // 可疑项判定：顺序推定 / 花名册纠错 / 名册外自证编号 / 编号来自低可信候选池 / 未识别出编号
         const corrected = segPages.some((p) => p.animalId === aid && p.corrected)
+        const offRoster = segPages.some((p) => p.animalId === aid && p.offRoster)
         const lowConf = !!aid && segPages.some((p) => p.animalId === aid && p.idSource === 'pool')
-        const suspect = guessed || corrected || lowConf || !aid
+        const suspect = guessed || corrected || offRoster || lowConf || !aid
         // 整本只拆出一段且什么也没识别到时，保留原文件名
         const fallback = segs.length === 1 ? it.origName : `${it.origName}_p${seg.start + 1}`
         // 档案页没识别出编号：不用笼统标题命名（避免看起来像识别成功），用原名+页码
@@ -555,6 +572,7 @@ export default function App() {
           animalId: aid,
           guessed,
           corrected,
+          offRoster,
           lowConf,
           suspect,
           newName: name,
@@ -1037,6 +1055,11 @@ export default function App() {
                           编号经花名册纠错
                         </span>
                       )}
+                      {o.offRoster && (
+                        <span className="ml-1 bg-[#d97706]/10 px-1.5 py-0.5 text-[#d97706]">
+                          编号不在花名册
+                        </span>
+                      )}
                       {o.lowConf && (
                         <span className="ml-1 bg-[#d97706]/10 px-1.5 py-0.5 text-[#d97706]">
                           编号低可信
@@ -1126,9 +1149,9 @@ export default function App() {
                     </summary>
                     <div className="mt-2 ml-2 border-l-2 border-[#e3e0d6] pl-3">
                       <p className="text-[#6b675c]">
-                        标题：{h.title ?? '—'}　编号：{h.animalId ?? '—'}
+                        标题：{h.title ?? '—'}{'　'}编号：{h.animalId ?? '—'}
                         {h.guessed ? '（按检测表顺序推定）' : ''}
-                        {h.pages ? `　页码：${h.pages}` : ''}
+                        {h.pages ? `\u3000页码：${h.pages}` : ''}
                       </p>
                       {h.debug && h.debug.length > 0 && (
                         <pre className="mt-1 max-h-48 overflow-auto bg-[#eceade] p-2 leading-relaxed whitespace-pre-wrap">

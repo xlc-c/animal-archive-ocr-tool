@@ -18,6 +18,9 @@ export interface PageCacheEntry {
     animalId?: string
     idSource?: 'label' | 'filename' | 'pool' | 'fallback' | null
     idCandidates?: string[]
+    /** v2 新增：次级标签候选（top-k 救援交叉验证）、页内自证次数（防名册误纠） */
+    idAlts?: string[]
+    idEvidence?: number
   }
 }
 
@@ -35,10 +38,15 @@ interface CacheHandle {
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
+    // v2：提取逻辑升级（TATTOO 容错/页顶裸编号/idAlts 次级候选），旧缓存页缺少新字段，
+    // 直接清空重建——宁可重跑一次，也不用陈旧结果拆错动物
+    const req = indexedDB.open(DB_NAME, 2)
     req.onupgradeneeded = () => {
-      req.result.createObjectStore(STORE)
-      req.result.createObjectStore(META)
+      const db = req.result
+      for (const name of [STORE, META]) {
+        if (db.objectStoreNames.contains(name)) db.deleteObjectStore(name)
+        db.createObjectStore(name)
+      }
     }
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error)

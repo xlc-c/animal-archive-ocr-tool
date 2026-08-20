@@ -439,7 +439,7 @@ export async function recognizeCanvasPaddle(
       x: new ort.Tensor('float32', recData, [1, 3, REC_IMG_H, outW]),
     })
     const t0 = recOut[Object.keys(recOut)[0]]
-    const [_, t, dims] = t0.dims as unknown as [number, number, number]
+    const [, t, dims] = t0.dims as unknown as [number, number, number]
     const { text, confidence, alts } = ctcDecode(t0.data as Float32Array, t, dims, engine.keys)
     const clean = text.replace(/\s+/g, '')
     if (!clean) continue

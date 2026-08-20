@@ -199,7 +199,7 @@ export async function textLayerLines(
  * 编号格放大重识别：顶部高清渲染后定位编号标签行，把「标签右侧带」和「标签下方带」
  * 裁出放大 2.5 倍再认一次。用于整页+高清重试都认不出编号的顽固页（小字/盖章压字）。
  */
-const ID_CELL_LABEL = /耳号|耳标|纹身|Tattoo|Ear\s?Tag|猴\s*号|动物\s*编号|芯片\s*号|犬\s*号|原猴/i
+const ID_CELL_LABEL = /耳号|耳标|纹身|TATT[O0]{2}|Ear\s?Tag|猴\s*号|动物\s*编号|芯片\s*号|犬\s*号|原猴/i
 export async function ocrIdCell(
   doc: pdfjs.PDFDocumentProxy,
   pageIndex: number
@@ -354,8 +354,8 @@ const SPECIES_DOG = /犬|比格|Beagle|Dog/i
 const ID_LABELS = {
   pig: [/耳标?\s*号/, /纹身\s*号?/, /动物\s*编号/],
   monkey: [/原猴\s*号?/, /猴\s*号/, /Monkey'?s?\s*(No|ID)\.?/i, /动物\s*编号/, /耳标?\s*号/, /纹身\s*号?/],
-  dog: [/Tattoo/i, /Ear\s?Tag/i, /Chip\s?(No|ID|Number)\.?/i, /耳标?\s*号/, /芯片\s*号(?:码)?/, /犬\s*号/, /动物\s*编号/],
-  generic: [/动物\s*编号/, /原猴\s*号?/, /猴\s*号/, /Monkey'?s?\s*(No|ID)\.?/i, /Tattoo/i, /Ear\s?Tag/i, /耳标?\s*号/, /纹身\s*号?/, /芯片\s*号(?:码)?/],
+  dog: [/TATT[O0]{2}/i, /Ear\s?Tag/i, /Chip\s?(No|ID|Number)\.?/i, /耳标?\s*号/, /芯片\s*号(?:码)?/, /犬\s*号/, /动物\s*编号/],
+  generic: [/动物\s*编号/, /原猴\s*号?/, /猴\s*号/, /Monkey'?s?\s*(No|ID)\.?/i, /TATT[O0]{2}/i, /Ear\s?Tag/i, /耳标?\s*号/, /纹身\s*号?/, /芯片\s*号(?:码)?/],
 }
 /** 兜底标签：通用「编号」排除「合格证/母亲/父亲/动物/许可证编号」；裸 No./№（省合格证右上角证书号）
  *  排在通用「编号」前——某省合格证同时有「实验单位使用许可证编号」和裸 No.，证书号以 No. 为准 */
@@ -428,6 +428,11 @@ export interface ExtractedInfo {
   animalId: string | null
   /** 编号来源：label=标签行（最可信），filename=原文件名，pool/fallback=补救（低可信） */
   idSource: 'label' | 'filename' | 'pool' | 'fallback' | null
+  /** 编号在本页 OCR 行中出现的次数（TATTOO 格 + 页角水印双现 = 2），≥2 视为自证 */
+  idEvidence: number
+  /** 次级标签候选编号（如猴档案同时有「原猴号 A19xxxxx」和「序号 027」：
+      主编号取原猴号时，序号进这里，供 applyRoster top-k 救援交叉验证） */
+  idAlts: string[]
   /** 本页所有像编号的 token（用于文档级花名册对齐） */
   idCandidates: string[]
 }
@@ -631,6 +636,31 @@ export function extractInfo(
       }
     }
   }
+  // 5) 检疫证/合格证页顶裸编号（2026-08-21 新增）：证书号印在页顶、无任何标签，
+  //    且通常出现两次（条码数字 + 印刷体，如 4600419780 / 1101260850）。
+  //    限定 isCertDoc 页面（档案页整本同号会错并动物）；排除手机号；要求页顶 8% 内至少出现一次
+  if (!animalId && isCertDoc) {
+    const counts = new Map<string, { n: number; top: boolean }>()
+    for (const l of lines) {
+      const t = l.text.trim()
+      const m = /^(?:N[oO]?|№)\s*[:.:：]?\s*(\d{8,20})$/.exec(t) ?? /^(\d{8,20})$/.exec(t)
+      if (!m) continue
+      const v = m[1]
+      if (/^1[3-9]\d{9}$/.test(v)) continue // 手机号（货主/承运人联系电话常出现两次）
+      const midY = (l.bbox.y0 + l.bbox.y1) / 2 / pageHeight
+      const e = counts.get(v) ?? { n: 0, top: false }
+      e.n += 1
+      if (midY < 0.08) e.top = true
+      counts.set(v, e)
+    }
+    for (const [v, e] of counts) {
+      if (e.n >= 2 && e.top) {
+        animalId = `No.${v}`
+        idSource = 'fallback'
+        break
+      }
+    }
+  }
   // 收集本页所有像编号的 token（供文档级花名册对齐用）
   const idCandidates: string[] = []
   for (const l of lines) {
@@ -645,7 +675,25 @@ export function extractInfo(
       if (v && !idCandidates.includes(v)) idCandidates.push(v)
     }
   }
-  return { title, species, animalId, idSource, idCandidates }
+  // 编号在页内出现次数（含 No. 前缀剥离后比对）：自证强度供 applyRoster 防误纠
+  const bareId = animalId?.replace(/^No\./i, '')
+  const idEvidence = bareId
+    ? lines.reduce((n, l) => n + (l.text.includes(bareId) ? 1 : 0), 0)
+    : 0
+  // 次级标签候选：同一页可能有多个编号标签（猴档案：原猴号 A19xxxxx + 序号 027）。
+  // 主编号已取其一，其余入 idAlts 供花名册 top-k 救援交叉验证（如序号命中名册时纠正回原序号命名）
+  const idAlts: string[] = []
+  const altLabels = [...labels, /序\s*号/]
+  for (const label of altLabels) {
+    for (const l of lines) {
+      let v = valueAfterLabel(l.text, label)
+      if (!v && label.test(l.text)) {
+        v = rightCellValue(lines, l) ?? belowCellValue(lines, l)
+      }
+      if (v && v !== animalId && !idAlts.includes(v)) idAlts.push(v)
+    }
+  }
+  return { title, species, animalId, idSource, idEvidence, idAlts, idCandidates }
 }
 
 // ── 文档级「花名册」对齐 ─────────────────────────────────────────────
@@ -660,9 +708,15 @@ export interface RosterPage {
   animalId?: string
   idSource?: string | null
   idCandidates?: string[]
+  /** 次级标签候选编号（如猴档案的序号 027，主编号是原猴号时）——top-k 救援交叉验证用 */
+  idAlts?: string[]
+  /** 编号在页内 OCR 行中出现次数（≥2 = 编号格+水印双现自证），防花名册误纠 */
+  idEvidence?: number
   guessed?: boolean
   /** 编号被花名册纠错改过（编辑距离匹配），需人工核对 */
   corrected?: boolean
+  /** 编号自证充分但不在花名册里（名册页 OCR 漏读），需人工核对 */
+  offRoster?: boolean
   /** 花名册清单页：一页里出现 ≥3 个花名册编号，说明是清单/汇总页，不归属任何单个动物 */
   rosterPage?: boolean
 }
@@ -709,14 +763,14 @@ function buildRoster(pages: RosterPage[]): string[] {
   return best.length >= 5 ? best : []
 }
 
-/** 与花名册对不上的编号：先剥尾巴，再试编辑距离 ≤2 的唯一匹配 */
-function fuzzyMatch(id: string, roster: string[]): string | null {
+/** 与花名册对不上的编号：先剥尾巴，再试编辑距离 ≤maxDist 的唯一匹配 */
+function fuzzyMatch(id: string, roster: string[], maxDist = 2): string | null {
   const up = id.toUpperCase()
   let v = up
   while (v.length > 3 && !roster.includes(v) && /[A-Z]$/.test(v)) v = v.slice(0, -1)
   if (roster.includes(v)) return v
   const near = roster.filter(
-    (r) => Math.abs(r.length - up.length) <= 2 && editDistance(r, up) <= 2
+    (r) => Math.abs(r.length - up.length) <= maxDist && editDistance(r, up) <= maxDist
   )
   return near.length === 1 ? near[0] : null
 }
@@ -732,10 +786,34 @@ export function applyRoster(pages: RosterPage[], externalRoster?: string[]): voi
     ? [...new Set(externalRoster.map((s) => s.toUpperCase()))]
     : buildRoster(pages)
   if (roster.length === 0) return
-  const inRoster = (id?: string) => !!id && roster.includes(id.toUpperCase())
+  // 名册扩充（2026-08-21）：名册页本身可能 OCR 漏读某个编号（实测发货清单漏读
+  // 8343597/8343830，导致这两只的档案页被"纠错"成相邻编号 8343512/8343083 而合并丢狗）。
+  // 标签提取且页内自证 ≥2 次（编号格+水印双现）的编号视为真实动物，直接并入名册：
+  // 不再参与纠错/丢弃，也不会被顺序推定覆盖。
+  // 限定与名册同形态（同字母前缀+同位数）：猴档案的「原猴号 A19xxxxx」也是标签双现，
+  // 但本批工作编号是序号 001-078，形态不同不能入册，否则 top-k 救援（→027）会被跳过
+  const keyOf = (id: string) => {
+    const m = id.match(/^([A-Z]*)(\d+)$/i)
+    return m ? `${m[1].toUpperCase()}#${m[2].length}` : null
+  }
+  const rosterKey = roster.length > 0 ? keyOf(roster[0]) : null
+  const rosterSet = new Set(roster.map((r) => r.toUpperCase()))
+  for (const p of pages) {
+    if (p.idSource === 'label' && p.animalId && (p.idEvidence ?? 0) >= 2) {
+      const k = keyOf(p.animalId)
+      if (k && k === rosterKey) rosterSet.add(p.animalId.toUpperCase())
+    }
+    // 次级标签候选也可能是名册漏读的真实批次序号（实测猴名册页恰好漏读 052/078，
+    // 而这两页主编号取了原猴号 A19xxxxx）：标签渠道提取且与名册同形态 → 入册，
+    // 让 top-k 救援能把这些页纠正回序号命名
+    for (const a of p.idAlts ?? []) {
+      const k = keyOf(a)
+      if (k && k === rosterKey) rosterSet.add(a.toUpperCase())
+    }
+  }
+  const inRoster = (id?: string) => !!id && rosterSet.has(id.toUpperCase())
   // 0) 花名册清单页检测：候选编号里命中花名册 ≥3 个的页（寄宿费清单/订购单/总清单等），
   //    不属于任何单一动物，标记后由分段逻辑强制独立成段
-  const rosterSet = new Set(roster.map((r) => r.toUpperCase()))
   for (const p of pages) {
     const hits = new Set(
       (p.idCandidates ?? []).map((c) => c.toUpperCase()).filter((c) => rosterSet.has(c))
@@ -750,7 +828,10 @@ export function applyRoster(pages: RosterPage[], externalRoster?: string[]): voi
   const bare = (id: string) => id.replace(/^No\./i, '') // 单据编号前缀（No.A2026…）不参与花名册比对
   for (const p of pages) {
     if (!p.animalId || inRoster(p.animalId) || inRoster(bare(p.animalId))) continue
-    const fixed = fuzzyMatch(bare(p.animalId), roster)
+    // 纯数字连续编号簇里编辑距离 ≤2 的相邻编号极可能是两只不同动物（8343597→8343512 实测误纠），
+    // 只有 1 处差异（单字符错读/多读/漏读）才允许纠错
+    const numericDense = /^\d+$/.test(bare(p.animalId))
+    const fixed = fuzzyMatch(bare(p.animalId), roster, numericDense ? 1 : 2)
     if (fixed) {
       p.animalId = fixed // 能对上花名册 → 用标准动物编号
       p.corrected = true // 标记纠错，结果列表高亮提示人工核对
@@ -758,15 +839,22 @@ export function applyRoster(pages: RosterPage[], externalRoster?: string[]): voi
     }
     // CTC top-k × 花名册组合纠错：top-1 误读超编辑距离阈值（或双向都近、判不出唯一）时，
     // 候选池（含 top-2 alt）里若有且仅有一个精确命中花名册的编号 → 采用，标 corrected。
-    // 限定唯一命中防误救（命中 ≥2 个说明是清单页或串号，不动）。
+    // 命中 ≥2 个时：若次级标签候选（idAlts，如猴档案序号）与命中的交集唯一，则用交集项
+    // （实测 p50 候选池 [027,022] 双命中，但序号标签值就是 027 → 交叉验证救回序号命名）；
+    // 否则保持不动（清单页或真串号）。
     if (!/^No\./i.test(p.animalId)) {
       const hits = [
         ...new Set(
           (p.idCandidates ?? []).map((c) => c.toUpperCase()).filter((c) => rosterSet.has(c))
         ),
       ]
-      if (hits.length === 1) {
-        p.animalId = hits[0]
+      let pick: string | null = hits.length === 1 ? hits[0] : null
+      if (!pick && hits.length > 1) {
+        const cross = hits.filter((h) => (p.idAlts ?? []).some((a) => a.toUpperCase() === h))
+        if (cross.length === 1) pick = cross[0]
+      }
+      if (pick) {
+        p.animalId = pick
         p.corrected = true
         continue
       }
@@ -775,6 +863,8 @@ export function applyRoster(pages: RosterPage[], externalRoster?: string[]): voi
       continue // 合格证/发票等单据编号：本来就不在花名册里，保留
     } else if (p.idSource === 'pool' || p.idSource === 'fallback') {
       p.animalId = undefined // 低可信来源对不上花名册，按未识别处理
+    } else if (p.idSource === 'label' && (p.idEvidence ?? 0) >= 1) {
+      p.offRoster = true // 标签提取但对不上名册：保留编号，标待核对（绝不并入别只动物）
     }
   }
   // 2) 档案页序列 + 锚点（自身编号在花名册里的档案页）
@@ -785,7 +875,9 @@ export function applyRoster(pages: RosterPage[], externalRoster?: string[]): voi
   const anchors: { ai: number; ri: number }[] = []
   archPages.forEach((pi, ai) => {
     const id = pages[pi].animalId
-    if (inRoster(id)) anchors.push({ ai, ri: roster.indexOf(id!.toUpperCase()) })
+    // 只用原始名册成员做锚点：扩充成员的 ri 不在原始顺序里，会破坏偏移一致性
+    const ri = id ? roster.indexOf(id.toUpperCase()) : -1
+    if (ri >= 0) anchors.push({ ai, ri })
   })
   if (anchors.length < 3) return
   const offset = anchors[0].ai - anchors[0].ri
@@ -794,6 +886,7 @@ export function applyRoster(pages: RosterPage[], externalRoster?: string[]): voi
   archPages.forEach((pi, ai) => {
     const p = pages[pi]
     if (inRoster(p.animalId)) return
+    if (p.animalId && p.idSource === 'label') return // 标签渠道已拿到编号（offRoster）：只标待核对，绝不用推定覆盖
     const ri = ai - offset
     if (ri >= 0 && ri < roster.length) {
       p.animalId = roster[ri]
@@ -841,6 +934,8 @@ export interface ArchiveRowInput {
   pageRange: string
   guessed?: boolean
   corrected?: boolean
+  /** 编号自证充分但不在花名册里（名册页漏读），需人工核对 */
+  offRoster?: boolean
   mergedCount?: number
   /** 额外备注（如中英文双版交叉验证差异），原样并入「备注」列 */
   extraNote?: string
@@ -1030,6 +1125,7 @@ export function extractArchiveRow(o: ArchiveRowInput) {
     备注: [
       o.guessed ? '编号为顺序推定' : '',
       o.corrected ? '编号经花名册纠错' : '',
+      o.offRoster ? '编号不在花名册（名册页可能漏读）' : '',
       o.mergedCount ? `合并${o.mergedCount}个来源` : '',
       o.extraNote ?? '',
       ...missing,
