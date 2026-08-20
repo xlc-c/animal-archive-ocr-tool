@@ -1,0 +1,12 @@
+node_modules
+dist
+.venv-tools
+*.zip
+.git
+
+# 构建产物（40MB 单文件，发布在 GitHub Release，不进仓库）
+app/dist-offline/
+/动物档案OCR工具.html
+
+# 内部工作记录（含未脱敏测试数据，保留在本地与完整包中）
+/本轮对话纪要.md
