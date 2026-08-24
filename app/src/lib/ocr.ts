@@ -405,6 +405,8 @@ function cleanToken(raw: string): string | null {
   if (v.length < 3) return null
   // 纯数字编号至少 3 位，避免抓到年龄、序号
   if (/^\d+$/.test(v) && v.length < 3) return null
+  // 6) 含字母但数字占比不足一半的，是英文碎片（如 1DAM），不是编号
+  if (/[A-Za-z]/.test(v) && (v.match(/\d/g) ?? []).length / v.length < 0.5) return null
   return v
 }
 
@@ -590,6 +592,11 @@ export function extractInfo(
       if (!v || v.length > 14) continue
       const hasLetter = /[A-Z]/i.test(v)
       if (!hasLetter && (v.length < 5 || v.length > 8)) continue
+      // 含字母但数字占比不足一半的是英文碎片（如 1DAM），不是编号
+      if (hasLetter) {
+        const digitCount = (v.match(/\d/g) ?? []).length
+        if (digitCount === 0 || digitCount / v.length < 0.5) continue
+      }
       const cy = (l.bbox.y0 + l.bbox.y1) / 2
       const h = l.bbox.y1 - l.bbox.y0
       const hasLeftLabel = lines.some(
