@@ -81,6 +81,29 @@ await w('",dict:')
 await w(JSON.stringify(fs.readFileSync(path.join(binDir, 'dict.txt'), 'utf8')))
 await w('};</script>')
 await w(`<script type="module">${jsContent}</script>`)
+
+// ---- 完整性自检：构建期算好各内嵌资源的 FNV-1a 校验值，运行期复核 ----
+// 40MB 单文件在下载/另存过程中字节损坏会表现为各种莫名报错（踩坑：预览无反应实为包损坏），
+// 启动时花 <1s 校验，损坏则明确提示重新下载。
+const fnv = (s) => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16) + ':' + s.length
+}
+const b64Of = (f) => fs.readFileSync(f).toString('base64')
+const expected = {
+  js: fnv(jsContent),
+  det: fnv(b64Of(path.join(binDir, 'det.onnx'))),
+  rec: fnv(b64Of(path.join(binDir, 'rec.onnx'))),
+  wasm: fnv(b64Of(path.join(binDir, 'ort.wasm'))),
+  dict: fnv(fs.readFileSync(path.join(binDir, 'dict.txt'), 'utf8')),
+}
+const hasCls = fs.existsSync(path.join(binDir, 'cls.onnx'))
+if (hasCls) expected.cls = fnv(b64Of(path.join(binDir, 'cls.onnx')))
+await w(`<script>;setTimeout(function(){try{function fv(s){var h=0x811c9dc5;for(var i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,0x01000193)}return (h>>>0).toString(16)+":"+s.length}var exp=${JSON.stringify(expected)};var B=window.__BIN__||{};var bad=[];var mod=document.querySelector('script[type="module"]');if(!mod||fv(mod.textContent)!==exp.js)bad.push("\u4e3b\u7a0b\u5e8f");var items=[["\u68c0\u6d4b\u6a21\u578b","det"],["\u8bc6\u522b\u6a21\u578b","rec"],["\u63a8\u7406\u5e93","wasm"],["\u5b57\u5178","dict"]];if(exp.cls)items.push(["\u65b9\u5411\u6a21\u578b","cls"]);for(var q=0;q<items.length;q++){var k=items[q][1];if(typeof B[k]!=="string"||fv(B[k])!==exp[k])bad.push(items[q][0])}if(bad.length)(window.__showErr||alert)("\u6587\u4ef6\u5df2\u635f\u574f\uff1a"+bad.join("\u3001")+"\u6821\u9a8c\u5931\u8d25\u3002\u8bf7\u91cd\u65b0\u4e0b\u8f7d\u672c\u5de5\u5177\uff0c\u5426\u5219\u4f1a\u51fa\u73b0\u83ab\u540d\u62a5\u9519\u3002")}catch(_){}},500);</script>`)
 await w(post)
 await new Promise((res) => out.end(res))
 

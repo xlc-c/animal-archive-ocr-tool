@@ -2,6 +2,32 @@
 <html lang="">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      // 全局错误红条：任何静默 JS 错误（含 Worker/异步）都显示在页面底部，便于用户截图反馈
+      ;(function () {
+        function showErr(m) {
+          try {
+            var b = document.getElementById('__errbar')
+            if (!b) {
+              b = document.createElement('div')
+              b.id = '__errbar'
+              b.style.cssText =
+                'position:fixed;left:0;right:0;bottom:0;z-index:99999;background:#b91c1c;color:#fff;font:12px/1.5 monospace;padding:8px 12px;white-space:pre-wrap;max-height:40vh;overflow:auto'
+              ;(document.body || document.documentElement).appendChild(b)
+            }
+            b.textContent += m + '\n'
+          } catch (_) {}
+        }
+        window.__showErr = showErr
+        window.addEventListener('error', function (e) {
+          showErr('JS错误：' + (e.message || e.type) + ' @ ' + String(e.filename || '').split('/').pop() + ':' + e.lineno)
+        })
+        window.addEventListener('unhandledrejection', function (e) {
+          var r = e.reason
+          showErr('异步错误：' + ((r && (r.stack || r.message)) || r || e.type))
+        })
+      })()
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>扫描件PDF智能重命名</title>
     <meta name="description" content="Config-driven template for cinematic lunar observatory websites." />
