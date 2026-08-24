@@ -146,26 +146,62 @@ function PdfPreview({
   const [status, setStatus] = useState('加载中…')
   useEffect(() => {
     let cancelled = false
+    let openedDoc: { destroy(): Promise<void> } | null = null
+    let io: IntersectionObserver | null = null
+    // 懒加载渲染串行排队，避免多页同时渲染占爆内存
+    let chain: Promise<void> = Promise.resolve()
     ;(async () => {
       try {
         // slice() 拷一份：pdfjs 会 detach 传入的 buffer
         const { doc, pageCount } = await openPdfBuffer(data.slice().buffer as ArrayBuffer)
-        for (let i = 0; i < pageCount; i++) {
-          if (cancelled) break
-          setStatus(`渲染第 ${i + 1}/${pageCount} 页…`)
-          const canvas = (await renderPage(doc, i, 1400)) as HTMLCanvasElement
-          if (cancelled) break
-          canvas.className = 'w-full shadow-sm'
-          bodyRef.current?.appendChild(canvas)
+        openedDoc = doc
+        const loadPage = (ph: HTMLDivElement, idx: number) => {
+          chain = chain.then(async () => {
+            if (cancelled) return
+            try {
+              const canvas = (await renderPage(doc, idx, 1200)) as HTMLCanvasElement
+              if (cancelled) return
+              canvas.className = 'w-full shadow-sm'
+              ph.replaceWith(canvas)
+            } catch {
+              ph.textContent = '本页渲染失败'
+            }
+          })
         }
-        if (!cancelled) setStatus('')
-        await doc.destroy()
+        // 首屏只渲染第 1 页（秒开）；其余页放占位块，滚动到时再渲染
+        io = new IntersectionObserver(
+          (entries) => {
+            for (const en of entries) {
+              if (!en.isIntersecting) continue
+              const el = en.target as HTMLDivElement
+              io!.unobserve(el)
+              loadPage(el, Number(el.dataset.p))
+            }
+          },
+          { rootMargin: '600px' }
+        )
+        const first = (await renderPage(doc, 0, 1200)) as HTMLCanvasElement
+        if (cancelled) return
+        first.className = 'w-full shadow-sm'
+        bodyRef.current?.appendChild(first)
+        for (let i = 1; i < pageCount; i++) {
+          const ph = document.createElement('div')
+          ph.dataset.p = String(i)
+          ph.style.cssText =
+            'height:1000px;display:flex;align-items:center;justify-content:center;color:#9a958a;font-size:12px'
+          ph.textContent = `第 ${i + 1} 页 · 滚动至此自动加载`
+          bodyRef.current?.appendChild(ph)
+          io.observe(ph)
+        }
+        setStatus(pageCount > 1 ? `共 ${pageCount} 页` : '')
       } catch (e) {
         if (!cancelled) setStatus('预览失败：' + (e instanceof Error ? e.message : String(e)))
       }
     })()
     return () => {
       cancelled = true
+      io?.disconnect()
+      void openedDoc?.destroy()
     }
   }, [data])
   return (
@@ -636,14 +672,42 @@ export default function App() {
     setRunning(false)
   }
 
-  const downloadOutput = (o: OutputFile) => {
-    const blob = new Blob([o.bytes as BlobPart], { type: 'application/pdf' })
+  /** 保存文件：优先走「另存为」对话框（File System Access API）。
+   *  这样写出的文件不带 Windows 网络来源标记（MOTW），资源管理器可正常预览/打开；
+   *  不支持的环境回退普通下载。用户取消（AbortError）则静默不保存。 */
+  const saveBlob = async (blob: Blob, filename: string): Promise<void> => {
+    const picker = (
+      window as unknown as {
+        showSaveFilePicker?: (o: {
+          suggestedName: string
+        }) => Promise<{
+          createWritable(): Promise<{ write(b: Blob): Promise<void>; close(): Promise<void> }>
+        }>
+      }
+    ).showSaveFilePicker
+    if (picker) {
+      try {
+        const handle = await picker.call(window, { suggestedName: filename })
+        const w = await handle.createWritable()
+        await w.write(blob)
+        await w.close()
+        return
+      } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') return
+        // 其余错误（如沙盒环境不支持）落回普通下载
+      }
+    }
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = dispName(o) + '.pdf'
+    a.download = filename
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  const downloadOutput = (o: OutputFile) => {
+    const blob = new Blob([o.bytes as BlobPart], { type: 'application/pdf' })
+    void saveBlob(blob, dispName(o) + '.pdf')
   }
 
   /** 结果列表手动改名：去掉非法字符；清空则恢复自动命名 */
@@ -670,12 +734,7 @@ export default function App() {
       .join('\n\n')
     zip.file('_OCR原文汇总.txt', debugAll)
     const blob = await zip.generateAsync({ type: 'blob' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = '识别拆分结果.zip'
-    a.click()
-    URL.revokeObjectURL(url)
+    await saveBlob(blob, '识别拆分结果.zip')
   }
 
   /** 从段内 OCR 文本提取档案字段（实现见 lib/ocr.ts 的 extractArchiveRow） */
@@ -690,12 +749,12 @@ export default function App() {
     const wb = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(wb, ws, '动物档案')
     const out = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer
-    const url = URL.createObjectURL(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))
-    const a = document.createElement('a')
-    a.href = url
-    a.download = '动物档案汇总.xlsx'
-    a.click()
-    URL.revokeObjectURL(url)
+    void saveBlob(
+      new Blob([out], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      }),
+      '动物档案汇总.xlsx'
+    )
   }
 
   const pendingCount = items.filter((i) => i.status !== 'done').length
@@ -1167,6 +1226,7 @@ export default function App() {
         )}
 
         <footer className="mt-16 border-t border-[#e3e0d6] pt-6 text-xs leading-relaxed text-[#6b675c]">
+          <p className="mb-1 text-[#9a958a]">构建版本 2026-08-24 v1.1.2 · 完全离线运行，文件不上传。</p>
           <p>
             提示：下载到的是拆分重命名后的副本，原始文件不会被改动。
             猪识别「耳标号/耳号/纹身号」，猴子识别「猴号/动物编号」，犬识别「耳号/芯片号」。
