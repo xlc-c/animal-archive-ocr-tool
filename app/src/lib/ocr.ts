@@ -437,6 +437,8 @@ export interface ExtractedInfo {
   idAlts: string[]
   /** 本页所有像编号的 token（用于文档级花名册对齐） */
   idCandidates: string[]
+  /** 清单/表格页（页内多主体：同形态编号成簇或同构行重复）：不提取动物编号，分段时强制独立成段 */
+  listPage?: boolean
 }
 
 /** 从纯文本里提取编号 token（用于右侧相邻单元格） */
@@ -541,6 +543,48 @@ export function extractInfo(
           : ID_LABELS.generic
   let animalId: string | null = null
   let idSource: ExtractedInfo['idSource'] = null
+  // ── 页内结构信号（不依赖标题文字，见交接文档「踩坑 53」）──
+  // 人眼分辨「个体档案 vs 清单页」靠的是版面结构而非文字：单主体表单 vs 多主体密表。
+  // 对应两个可计算信号：① 页内同形态编号簇大小（多主体检测）；② 同构行重复数（表格签名）。
+  // 先收集本页全部编号形态 token：结构判定与文档级花名册共建共用这份数据
+  const idCandidates: string[] = []
+  for (const l of lines) {
+    const v = tokenFromText(l.text, true)
+    if (v && !idCandidates.includes(v)) idCandidates.push(v)
+  }
+  // CTC top-2 候选（编号行的次优解码路径）一并入册：
+  // top-1 误读但 top-2 命中花名册时，applyRoster 的组合纠错能救回来
+  for (const l of lines) {
+    for (const a of l.alts ?? []) {
+      const v = tokenFromText(a, true)
+      if (v && !idCandidates.includes(v)) idCandidates.push(v)
+    }
+  }
+  // ① 最大同形态（字母前缀#位数）distinct 编号簇
+  let idClusterMax = 0
+  {
+    const clusters = new Map<string, Set<string>>()
+    for (const c of idCandidates) {
+      const k = idShapeKey(c)
+      if (!k) continue
+      const s = clusters.get(k) ?? new Set<string>()
+      s.add(c.toUpperCase())
+      clusters.set(k, s)
+      if (s.size > idClusterMax) idClusterMax = s.size
+    }
+  }
+  // ② 同构行重复数（行骨架：数字段→#、字母段→A、中文段→中；剔无数字或过短的骨架防噪声）
+  let tableSkeleton = 0
+  {
+    const skels = new Map<string, number>()
+    for (const l of lines) {
+      const s = lineSkeleton(l.text)
+      if (s.length < 4 || !s.includes('#')) continue
+      const n = (skels.get(s) ?? 0) + 1
+      skels.set(s, n)
+      if (n > tableSkeleton) tableSkeleton = n
+    }
+  }
   // 1) 按物种优先级的标签：同一行取值，或取右侧相邻单元格
   outer: for (const label of labels) {
     for (const l of lines) {
@@ -560,8 +604,29 @@ export function extractInfo(
       }
     }
   }
+  // 标签取值的页内自证强度（编号格+水印双现 = 2）
+  const countEvidence = (id: string | null) => {
+    const bare = id?.replace(/^No\./i, '')
+    return bare ? lines.reduce((n, l) => n + (l.text.includes(bare) ? 1 : 0), 0) : 0
+  }
+  let idEvidence = countEvidence(animalId)
+  // 多主体页（清单/汇总表）：编号簇 ≥5 直接判定；簇 3~4 个时要求同构行 ≥5 佐证
+  // （OCR 把大部分编号读烂时簇会缩水，骨架重复是第二信号）。
+  // 「单主体签名」豁免：标签编号页内双现自证的页不是清单页——档案页里也可能有
+  // 同构表格（疫苗记录行）和父母编号小簇，不能误杀。
+  const selfProved = idSource === 'label' && idEvidence >= 2
+  const listPage = !selfProved && (idClusterMax >= 5 || (idClusterMax >= 3 && tableSkeleton >= 5))
+  // 列头陷阱：标签行其实是表格列头（如「耳号No.ofear」，belowCellValue 取到首行数据）。
+  // 簇 ≥4 且值无自证 → 作废（小批次清单页编号簇不满 5 时的补网）
+  const columnHeaderTrap = !listPage && idSource === 'label' && idClusterMax >= 4 && idEvidence <= 1
+  // 多主体/表格页不信任任何动物编号通道（label/filename/pool）；No. 单据兜底保留
+  const noAnimalPage = listPage || columnHeaderTrap
+  if (noAnimalPage) {
+    animalId = null
+    idSource = null
+  }
   // 2) 原文件名就是编号时直接采用（比 OCR 补救更可靠，如 1300001、B265003）
-  if (!animalId && filenameHint) {
+  if (!animalId && !noAnimalPage && filenameHint) {
     animalId = idFromFilename(filenameHint)
     if (animalId) idSource = 'filename'
   }
@@ -576,7 +641,7 @@ export function extractInfo(
   const isFormDoc = !!title && /记录|单据|发货|接收|清单|凭证|发票|申购|订购|申请/.test(titleFlat) && !/档案/.test(titleFlat)
   // 报告/证明/合格证/检疫类单据：编号走兜底标签（加 No. 前缀才能扛住花名册丢弃），跳过候选池
   const isCertDoc = !!title && /报告|证明|合格证|检疫/.test(titleFlat) && !/档案/.test(titleFlat)
-  if (!animalId && !isFormDoc && !isCertDoc) {
+  if (!animalId && !noAnimalPage && !isFormDoc && !isCertDoc) {
     const pool: { v: string; score: number }[] = []
     for (const l of lines) {
       const midY = (l.bbox.y0 + l.bbox.y1) / 2 / pageHeight
@@ -668,39 +733,25 @@ export function extractInfo(
       }
     }
   }
-  // 收集本页所有像编号的 token（供文档级花名册对齐用）
-  const idCandidates: string[] = []
-  for (const l of lines) {
-    const v = tokenFromText(l.text, true)
-    if (v && !idCandidates.includes(v)) idCandidates.push(v)
-  }
-  // CTC top-2 候选（编号行的次优解码路径）一并入册：
-  // top-1 误读但 top-2 命中花名册时，applyRoster 的组合纠错能救回来
-  for (const l of lines) {
-    for (const a of l.alts ?? []) {
-      const v = tokenFromText(a, true)
-      if (v && !idCandidates.includes(v)) idCandidates.push(v)
-    }
-  }
-  // 编号在页内出现次数（含 No. 前缀剥离后比对）：自证强度供 applyRoster 防误纠
-  const bareId = animalId?.replace(/^No\./i, '')
-  const idEvidence = bareId
-    ? lines.reduce((n, l) => n + (l.text.includes(bareId) ? 1 : 0), 0)
-    : 0
+  // idCandidates 已前移收集（结构信号判定要用）；此处只重算最终编号的页内自证强度
+  // （fallback 等后续通道可能改写了 animalId）
+  idEvidence = countEvidence(animalId)
   // 次级标签候选：同一页可能有多个编号标签（猴档案：原猴号 A19xxxxx + 序号 027）。
   // 主编号已取其一，其余入 idAlts 供花名册 top-k 救援交叉验证（如序号命中名册时纠正回原序号命名）
   const idAlts: string[] = []
-  const altLabels = [...labels, /序\s*号/]
-  for (const label of altLabels) {
-    for (const l of lines) {
-      let v = valueAfterLabel(l.text, label)
-      if (!v && label.test(l.text)) {
-        v = rightCellValue(lines, l) ?? belowCellValue(lines, l)
+  if (!listPage) {
+    const altLabels = [...labels, /序\s*号/]
+    for (const label of altLabels) {
+      for (const l of lines) {
+        let v = valueAfterLabel(l.text, label)
+        if (!v && label.test(l.text)) {
+          v = rightCellValue(lines, l) ?? belowCellValue(lines, l)
+        }
+        if (v && v !== animalId && !idAlts.includes(v)) idAlts.push(v)
       }
-      if (v && v !== animalId && !idAlts.includes(v)) idAlts.push(v)
     }
   }
-  return { title, species, animalId, idSource, idEvidence, idAlts, idCandidates }
+  return { title, species, animalId, idSource, idEvidence, idAlts, idCandidates, listPage }
 }
 
 // ── 文档级「花名册」对齐 ─────────────────────────────────────────────
@@ -744,30 +795,47 @@ function editDistance(a: string, b: string): number {
   return dp[n]
 }
 
-/** 从所有页里找「同前缀+同位数」的最大编号簇（≥5 个才认作花名册） */
+/** 编号形态键：字母前缀#数字位数（同形态成簇判定，extractInfo 清单页检测与花名册共用） */
+function idShapeKey(id: string): string | null {
+  const m = id.match(/^([A-Z]*)(\d+)$/i)
+  return m ? `${m[1].toUpperCase()}#${m[2].length}` : null
+}
+
+/** 行结构骨架：数字段→#、字母段→A、中文段→中。同构行重复计数是表格式版面的结构签名 */
+function lineSkeleton(t: string): string {
+  return t
+    .replace(/\s+/g, '')
+    .replace(/\d+/g, '#')
+    .replace(/[A-Za-z]+/g, 'A')
+    .replace(/[一-鿿]+/g, '中')
+}
+
+/** 从所有页里找「同前缀+同位数」的最大编号簇（≥5 个才认作花名册）。
+ *  字母前缀簇绝对优先：纯数字大簇多为表格测量值（OD 值/体重等）——实测一批猪档案里
+ *  抗体检测表的 ~50 个 OD 值簇挤掉了 26 个 B 编号动物名册（见踩坑 53）。
+ *  纯数字簇（犬批次 7050001 型）只在没有字母簇 ≥5 时启用。 */
 function buildRoster(pages: RosterPage[]): string[] {
-  let best: string[] = []
+  let bestLetter: string[] = []
+  let bestDigit: string[] = []
   for (const p of pages) {
     const groups = new Map<string, string[]>()
     for (const c of p.idCandidates ?? []) {
-      const m = c.match(/^([A-Z]*)(\d+)$/i)
-      if (!m) continue
-      const key = `${m[1].toUpperCase()}#${m[2].length}`
-      const g = groups.get(key) ?? []
+      const k = idShapeKey(c)
+      if (!k) continue
+      const g = groups.get(k) ?? []
       if (!g.includes(c.toUpperCase())) g.push(c.toUpperCase())
-      groups.set(key, g)
+      groups.set(k, g)
     }
     for (const g of groups.values()) {
-      // 同数量时优先带字母前缀的（避开 OD 值等纯数字串）
-      if (
-        g.length > best.length ||
-        (g.length === best.length && /[A-Z]/.test(g[0]) && !/[A-Z]/.test(best[0] ?? ''))
-      ) {
-        best = g
+      if (/[A-Z]/.test(g[0])) {
+        if (g.length > bestLetter.length) bestLetter = g
+      } else if (g.length > bestDigit.length) {
+        bestDigit = g
       }
     }
   }
-  return best.length >= 5 ? best : []
+  if (bestLetter.length >= 5) return bestLetter
+  return bestDigit.length >= 5 ? bestDigit : []
 }
 
 /** 与花名册对不上的编号：先剥尾巴，再试编辑距离 ≤maxDist 的唯一匹配 */
@@ -787,22 +855,20 @@ function fuzzyMatch(id: string, roster: string[], maxDist = 2): string | null {
  * - animalId 被纠错 / 丢弃 / 顺序推定（guessed=true）
  * - externalRoster：用户在页面上粘贴的编号清单。小批次（<5 只）花名册无法从
  *   页面自举（buildRoster 需 ≥5 个同簇编号），外部清单直接顶替花名册参与纠错/推定
+ * - 返回最终花名册规模（含扩充成员），0 = 未建成；供 UI 摘要展示供人工确认
  */
-export function applyRoster(pages: RosterPage[], externalRoster?: string[]): void {
+export function applyRoster(pages: RosterPage[], externalRoster?: string[]): number {
   const roster = externalRoster?.length
     ? [...new Set(externalRoster.map((s) => s.toUpperCase()))]
     : buildRoster(pages)
-  if (roster.length === 0) return
+  if (roster.length === 0) return 0
   // 名册扩充（2026-08-21）：名册页本身可能 OCR 漏读某个编号（实测发货清单漏读
   // 8343597/8343830，导致这两只的档案页被"纠错"成相邻编号 8343512/8343083 而合并丢狗）。
   // 标签提取且页内自证 ≥2 次（编号格+水印双现）的编号视为真实动物，直接并入名册：
   // 不再参与纠错/丢弃，也不会被顺序推定覆盖。
   // 限定与名册同形态（同字母前缀+同位数）：猴档案的「原猴号 A19xxxxx」也是标签双现，
   // 但本批工作编号是序号 001-078，形态不同不能入册，否则 top-k 救援（→027）会被跳过
-  const keyOf = (id: string) => {
-    const m = id.match(/^([A-Z]*)(\d+)$/i)
-    return m ? `${m[1].toUpperCase()}#${m[2].length}` : null
-  }
+  const keyOf = idShapeKey
   const rosterKey = roster.length > 0 ? keyOf(roster[0]) : null
   const rosterSet = new Set(roster.map((r) => r.toUpperCase()))
   for (const p of pages) {
@@ -886,9 +952,9 @@ export function applyRoster(pages: RosterPage[], externalRoster?: string[]): voi
     const ri = id ? roster.indexOf(id.toUpperCase()) : -1
     if (ri >= 0) anchors.push({ ai, ri })
   })
-  if (anchors.length < 3) return
+  if (anchors.length < 3) return rosterSet.size
   const offset = anchors[0].ai - anchors[0].ri
-  if (!anchors.every((a) => a.ai - a.ri === offset)) return // 顺序对不齐就不猜
+  if (!anchors.every((a) => a.ai - a.ri === offset)) return rosterSet.size // 顺序对不齐就不猜
   // 3) 按统一偏移顺序填补
   archPages.forEach((pi, ai) => {
     const p = pages[pi]
@@ -900,6 +966,7 @@ export function applyRoster(pages: RosterPage[], externalRoster?: string[]): voi
       p.guessed = true
     }
   })
+  return rosterSet.size
 }
 
 /** 生成不重复的最终文件名 */
@@ -999,7 +1066,7 @@ export function extractArchiveRow(o: ArchiveRowInput) {
           quality += 2
         }
       } else if (run.length >= 12 && run.length <= 17) {
-        // SIRE+DAM 粘连整串：均分（7+7 等）；长度为奇数多半是前导误读位（S→5），剥掉再均分
+        // SIRE+DAM 粘连整串：均分（7+7 等）；长度为奇数多半是前导误读位（S→5），剥 1~2 位再均分
         for (let drop = 0; drop <= 2; drop++) {
           const r = run.slice(drop)
           if (r.length < 12 || r.length > 16) continue
