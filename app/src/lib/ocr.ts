@@ -773,7 +773,7 @@ export interface RosterPage {
   guessed?: boolean
   /** 编号被花名册纠错改过（编辑距离匹配），需人工核对 */
   corrected?: boolean
-  /** 编号自证充分但不在花名册里（名册页 OCR 漏读），需人工核对 */
+  /** 编号自证充分但不在花名册里（名册页漏读），需人工核对 */
   offRoster?: boolean
   /** 花名册清单页：一页里出现 ≥3 个花名册编号，说明是清单/汇总页，不归属任何单个动物 */
   rosterPage?: boolean
@@ -1066,7 +1066,7 @@ export function extractArchiveRow(o: ArchiveRowInput) {
           quality += 2
         }
       } else if (run.length >= 12 && run.length <= 17) {
-        // SIRE+DAM 粘连整串：均分（7+7 等）；长度为奇数多半是前导误读位（S→5），剥 1~2 位再均分
+        // SIRE+DAM 粘连整串：均分（7+7 等）；长度为奇数多半是前导误读位（S→5），剥掉再均分
         for (let drop = 0; drop <= 2; drop++) {
           const r = run.slice(drop)
           if (r.length < 12 || r.length > 16) continue
