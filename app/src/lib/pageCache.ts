@@ -21,6 +21,8 @@ export interface PageCacheEntry {
     /** v2 新增：次级标签候选（top-k 救援交叉验证）、页内自证次数（防名册误纠） */
     idAlts?: string[]
     idEvidence?: number
+    /** v3 新增：清单/表格页结构判定（页内编号簇/同构行重复） */
+    listPage?: boolean
   }
 }
 
@@ -38,9 +40,9 @@ interface CacheHandle {
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    // v2：提取逻辑升级（TATTOO 容错/页顶裸编号/idAlts 次级候选），旧缓存页缺少新字段，
+    // v3：提取逻辑升级（页内结构信号 listPage/列头陷阱），旧缓存页缺少新字段，
     // 直接清空重建——宁可重跑一次，也不用陈旧结果拆错动物
-    const req = indexedDB.open(DB_NAME, 2)
+    const req = indexedDB.open(DB_NAME, 3)
     req.onupgradeneeded = () => {
       const db = req.result
       for (const name of [STORE, META]) {
