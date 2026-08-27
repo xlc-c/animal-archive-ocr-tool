@@ -52,6 +52,8 @@ interface OutputFile {
   debug?: string[]
   /** 由几个同编号段合并而来（中英文对照合并） */
   mergedCount?: number
+  /** 合并前的各来源段 id（取消合并用） */
+  mergedFrom?: string[]
   /** 中英文双版交叉验证差异（合并时检测），原样进 Excel 备注 */
   extraNote?: string
 }
@@ -136,14 +138,25 @@ function crossCheckZhEn(g: OutputFile[]): string {
 function PdfPreview({
   name,
   data,
+  mergedCount,
+  onSplit,
+  onUnmerge,
   onClose,
 }: {
   name: string
   data: Uint8Array
+  /** >1 时本文件由多段合并而来，可一键取消合并 */
+  mergedCount?: number
+  /** 在某页前把本文件拆成两个（0-based 页索引，1..pageCount-1）；未提供则不显示拆分条 */
+  onSplit?: (beforePage: number) => void
+  onUnmerge?: () => void
   onClose: () => void
 }) {
   const bodyRef = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState('加载中…')
+  // onSplit 走 ref：避免拆分回调变化触发整页重渲染
+  const onSplitRef = useRef(onSplit)
+  onSplitRef.current = onSplit
   useEffect(() => {
     let cancelled = false
     let openedDoc: { destroy(): Promise<void> } | null = null
@@ -185,6 +198,18 @@ function PdfPreview({
         first.className = 'w-full shadow-sm'
         bodyRef.current?.appendChild(first)
         for (let i = 1; i < pageCount; i++) {
+          // 页间拆分条：预览核对时发现混进来的页，可直接在此把文件切成两个
+          if (onSplitRef.current) {
+            const div = document.createElement('div')
+            div.className = 'flex items-center justify-center py-0.5'
+            const btn = document.createElement('button')
+            btn.className =
+              'border border-dashed border-[#b91c1c]/50 px-2 py-0.5 text-xs text-[#b91c1c] hover:bg-[#b91c1c]/5'
+            btn.textContent = `✂ 在此拆分（第 ${i + 1} 页起为新文件）`
+            btn.onclick = () => onSplitRef.current?.(i)
+            div.appendChild(btn)
+            bodyRef.current?.appendChild(div)
+          }
           const ph = document.createElement('div')
           ph.dataset.p = String(i)
           ph.style.cssText =
@@ -213,6 +238,14 @@ function PdfPreview({
         <div className="flex items-center gap-3 border-b border-[#e3e0d6] px-4 py-3">
           <span className="min-w-0 flex-1 truncate font-mono text-sm font-medium">{name}.pdf</span>
           {status && <span className="shrink-0 text-xs text-[#6b675c]">{status}</span>}
+          {mergedCount && mergedCount > 1 && onUnmerge && (
+            <button
+              onClick={onUnmerge}
+              className="shrink-0 text-xs text-[#b91c1c] underline underline-offset-4 hover:opacity-70"
+            >
+              取消合并（拆回 {mergedCount} 段）
+            </button>
+          )}
           <button
             onClick={onClose}
             className="shrink-0 text-xs text-[#6b675c] underline underline-offset-4 hover:text-[#0f766e]"
@@ -241,6 +274,8 @@ interface PageInfo {
   /** 编号自证充分但不在花名册里（名册页漏读），需人工核对 */
   offRoster?: boolean
   rosterPage?: boolean // 花名册清单页（一页命中 ≥3 个花名册编号），强制独立成段
+  /** 清单/表格页（页内多主体结构判定：编号簇/同构行重复，不依赖花名册先验），强制独立成段 */
+  listPage?: boolean
 }
 
 export default function App() {
@@ -282,6 +317,10 @@ export default function App() {
   const [preview, setPreview] = useState<OutputFile | null>(null)
   // 结果列表只看待核对项
   const [onlySuspect, setOnlySuspect] = useState(false)
+  // 本批花名册规模（applyRoster 返回，>0 时显示在批次摘要里供人工确认名册选对）
+  const [rosterSize, setRosterSize] = useState(0)
+  // 取消合并的输出段 id 集合（这些段不再参与按编号合并）
+  const [unmergedIds, setUnmergedIds] = useState<Set<string>>(new Set())
 
   // 中英文对照合并：相同动物编号的段（来自不同文件）拼成一个 PDF。
   // 派生自 outputs，不改变原始拆分结果；关闭开关即回到原列表。
@@ -295,7 +334,7 @@ export default function App() {
       const result: OutputFile[] = []
       const byId = new Map<string, OutputFile[]>()
       for (const o of outputs) {
-        if (!o.animalId) {
+        if (!o.animalId || unmergedIds.has(o.id)) {
           result.push(o)
           continue
         }
@@ -332,6 +371,7 @@ export default function App() {
           extraNote: crossNote || undefined,
           bytes,
           mergedCount: g.length,
+          mergedFrom: g.map((x) => x.id),
         }
       }
       dedupeNames(result)
@@ -340,7 +380,7 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [outputs, mergeSameId, splitMode])
+  }, [outputs, mergeSameId, splitMode, unmergedIds])
 
   const displayOutputs = merged ?? outputs
 
@@ -422,8 +462,8 @@ export default function App() {
     let curHadArchive = false // 本段已出现过「档案」封面页
     pages.forEach((p, i) => {
       let brk = false
-      if (p.rosterPage) {
-        // 花名册/费用清单页：不归属任何单一动物，强制独立成段
+      if (p.rosterPage || p.listPage) {
+        // 花名册/费用清单/多主体表格页：不归属任何单一动物，强制独立成段
         brk = curId !== undefined || curTitle !== undefined || i > curStart
       } else if (p.animalId) {
         brk = p.animalId !== curId
@@ -495,6 +535,7 @@ export default function App() {
               idEvidence: info.idEvidence,
               idAlts: info.idAlts,
               idCandidates: info.idCandidates,
+              listPage: info.listPage,
             }
             // 逐页落盘：此刻中断，下次重开只补没跑完的页
             cache?.put(fileKey, i, { debug: debugPages[i], info: pages[i] })
@@ -568,8 +609,11 @@ export default function App() {
       }
       await Promise.all(Array.from({ length: pool.size }, runRetry))
       cache?.touch(fileKey, pageCount)
-      // 文档级修正：合集带检测表（编号清单）时，纠错/推定各页编号
-      if (splitMode !== 'page') applyRoster(pages, externalRoster)
+      // 文档级修正：合集带检测表（编号清单）时，纠错/推定各页编号；返回值=花名册规模
+      if (splitMode !== 'page') {
+        const n = applyRoster(pages, externalRoster)
+        if (n > 0) setRosterSize((prev) => Math.max(prev, n))
+      }
       // 拆分
       const srcDoc = await PDFDocument.load(buf, { ignoreEncryption: true })
       const segs =
@@ -755,6 +799,65 @@ export default function App() {
       }),
       '动物档案汇总.xlsx'
     )
+  }
+
+  /** 预览中的手动拆分：把一个输出文件从指定页切成两个（pdf-lib 物理拆页）。
+   *  前半保留原名与编号；后半无编号、标待核对置顶，自动命名后可行内改名。
+   *  作用于 outputs 原段，ZIP/Excel/合并视图全部自动跟随。 */
+  const splitOutput = async (o: OutputFile, beforeIdx: number) => {
+    if (running) return
+    const src = await PDFDocument.load(o.bytes, { ignoreEncryption: true })
+    const total = src.getPageCount()
+    if (beforeIdx < 1 || beforeIdx > total - 1) return
+    const mk = async (from: number, to: number) => {
+      const d = await PDFDocument.create()
+      const ps = await d.copyPages(src, Array.from({ length: to - from + 1 }, (_, k) => from + k))
+      ps.forEach((p) => d.addPage(p))
+      return d.save()
+    }
+    // pageRange 形如 "2-4"（单段必定是连续区间；合并项已先要求取消合并）
+    const m = /^(\d+)-(\d+)$/.exec(o.pageRange)
+    const startP = m ? +m[1] : null
+    const rng = (a: number, b: number) => (startP ? `${startP + a}-${startP + b}` : `${a + 1}-${b + 1}`)
+    const base = dispName(o)
+    const front: OutputFile = {
+      ...o,
+      id: crypto.randomUUID(),
+      bytes: await mk(0, beforeIdx - 1),
+      pageRange: rng(0, beforeIdx - 1),
+      debug: o.debug?.slice(0, beforeIdx),
+      mergedCount: undefined,
+      mergedFrom: undefined,
+      extraNote: undefined,
+    }
+    const back: OutputFile = {
+      ...o,
+      id: crypto.randomUUID(),
+      bytes: await mk(beforeIdx, total - 1),
+      pageRange: rng(beforeIdx, total - 1),
+      debug: o.debug?.slice(beforeIdx),
+      title: undefined,
+      animalId: undefined,
+      guessed: false,
+      corrected: false,
+      offRoster: false,
+      lowConf: false,
+      suspect: true,
+      customName: undefined,
+      mergedCount: undefined,
+      mergedFrom: undefined,
+      extraNote: undefined,
+      newName: `${base}_第${beforeIdx + 1}页起`,
+    }
+    setOutputs((prev) => {
+      const i = prev.findIndex((x) => x.id === o.id)
+      if (i < 0) return prev
+      const next = [...prev]
+      next.splice(i, 1, front, back)
+      dedupeNames(next)
+      return next
+    })
+    setPreview(null)
   }
 
   const pendingCount = items.filter((i) => i.status !== 'done').length
@@ -1017,6 +1120,7 @@ export default function App() {
             {/* 批次摘要 */}
             <p className="mt-1 text-xs leading-relaxed text-[#6b675c]">
               本批共 {batchSummary.total} 个文件：动物档案 {batchSummary.animals} 只
+              {rosterSize > 0 && ` · 花名册 ${rosterSize} 个编号`}
               {batchSummary.docs > 0 && `、单据 ${batchSummary.docs} 个`}
               {batchSummary.unidentified > 0 && `、未识别 ${batchSummary.unidentified} 个`}
               {batchSummary.suspects > 0 ? (
@@ -1226,7 +1330,7 @@ export default function App() {
         )}
 
         <footer className="mt-16 border-t border-[#e3e0d6] pt-6 text-xs leading-relaxed text-[#6b675c]">
-          <p className="mb-1 text-[#9a958a]">构建版本 2026-08-24 v1.1.2 · 完全离线运行，文件不上传。</p>
+          <p className="mb-1 text-[#9a958a]">构建版本 2026-08-25 v1.1.3 · 完全离线运行，文件不上传。</p>
           <p>
             提示：下载到的是拆分重命名后的副本，原始文件不会被改动。
             猪识别「耳标号/耳号/纹身号」，猴子识别「猴号/动物编号」，犬识别「耳号/芯片号」。
@@ -1236,9 +1340,27 @@ export default function App() {
         </footer>
       </div>
 
-      {/* 结果在线预览 */}
+      {/* 结果在线预览（合并项先取消合并再拆页；单段可直接页间拆分） */}
       {preview && (
-        <PdfPreview name={dispName(preview)} data={preview.bytes} onClose={() => setPreview(null)} />
+        <PdfPreview
+          name={dispName(preview)}
+          data={preview.bytes}
+          mergedCount={preview.mergedCount}
+          onSplit={
+            preview.mergedCount && preview.mergedCount > 1
+              ? undefined
+              : (i) => void splitOutput(preview, i)
+          }
+          onUnmerge={
+            preview.mergedCount && preview.mergedCount > 1
+              ? () => {
+                  setUnmergedIds((prev) => new Set([...prev, ...(preview.mergedFrom ?? [])]))
+                  setPreview(null)
+                }
+              : undefined
+          }
+          onClose={() => setPreview(null)}
+        />
       )}
     </div>
   )
