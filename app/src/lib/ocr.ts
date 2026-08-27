@@ -773,7 +773,7 @@ export interface RosterPage {
   guessed?: boolean
   /** 编号被花名册纠错改过（编辑距离匹配），需人工核对 */
   corrected?: boolean
-  /** 编号自证充分但不在花名册里（名册页漏读），需人工核对 */
+  /** 编号自证充分但不在花名册里（名册页 OCR 漏读），需人工核对 */
   offRoster?: boolean
   /** 花名册清单页：一页里出现 ≥3 个花名册编号，说明是清单/汇总页，不归属任何单个动物 */
   rosterPage?: boolean
