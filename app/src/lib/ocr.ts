@@ -638,7 +638,7 @@ export function extractInfo(
   // 单据类页面（记录表/发货单/清单等，非档案）没有动物编号，pool 补救只会抓到表单编号
   // 标题可能带 OCR 空格（「检 测 报 告」），剥掉再测文档类别
   const titleFlat = (title ?? '').replace(/\s+/g, '')
-  const isFormDoc = !!title && /记录|单据|发货|接收|清单|凭证|发票|申购|订购|申请/.test(titleFlat) && !/档案/.test(titleFlat)
+  const isFormDoc = !!title && /记录|单据|发货|接收|清单|凭证|发票|申购|订购|申请|装箱/.test(titleFlat) && !/档案/.test(titleFlat)
   // 报告/证明/合格证/检疫类单据：编号走兜底标签（加 No. 前缀才能扛住花名册丢弃），跳过候选池
   const isCertDoc = !!title && /报告|证明|合格证|检疫/.test(titleFlat) && !/档案/.test(titleFlat)
   if (!animalId && !noAnimalPage && !isFormDoc && !isCertDoc) {
@@ -1120,16 +1120,50 @@ export function extractArchiveRow(o: ArchiveRowInput) {
   // 体重：「体重/Weight」标签后（同行粘连或下一行）的数字，取文本序最后一次称重。
   // 值后禁止紧跟数字/小数点/短横——防止把相邻日期行（12-31-24）抓成 12
   let weight = ''
+  let weightPos = -1 // 文本序位置：同行版式与分行版式共用「最后一次称重」语义
   for (const m of text.matchAll(
     /(?:体重|weight)\s*[,，:：]?\s*(?:kg|公斤|公厅)?\s*\[?(\d+(?:\.\d+)?)(?![\d.-])/gi
   )) {
     weight = m[1]
+    weightPos = m.index ?? -1
   }
   // 标签驱动版式（食蟹猴/巴马猪档案：标签与值是相邻的独立 OCR 行，同一视觉行的值格紧跟标签格）
   const allLines = text.split('\n')
   const FULL_DATE = /^\s*\[?(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{2,4})\s*$/
   const FULL_TOKEN = /^\s*\[?((?=[A-Z0-9]*\d)[A-Z0-9]{5,12})\s*$/i
   const FULL_SEX = /^\s*([MF♂♀公母早])\s*$/i // 「早」是 ♀ 的常见误读
+  // 体重分行版式（2026-09-04 实测巴马猪/食蟹猴档案：标签与值各占独立 OCR 行，值在标签下 3 行内。
+  // 巴马猪：「体重/Bodyweight:（kg）」下一行「8.9」；食蟹猴：「体重」/「DateofBirth」/「Weight(kg)」/「2.30」）
+  // 只收整行独立数字（可带小数、允许前导 [；日期行 2026-9-3 / 12-30-25 含短横天然排除）；
+  // 跳过纯英文碎片行与其他字段标签行（猴版式多个标签行连着），遇实质内容行即停。
+  // 与同行版式共用「文本序最后一次称重」语义：仅当分行候选位置更靠后才覆盖。
+  const WEIGHT_LABEL = /体重|weight/i
+  const FULL_WEIGHT_NUM = /^\s*\[?(\d+(?:\.\d+)?)\s*$/
+  const WEIGHT_SKIP = /日期|Date|Birth|编号|ID|性别|Sex|Gender|体重|weight/i
+  const lineStart: number[] = []
+  {
+    let acc = 0
+    for (const l of allLines) {
+      lineStart.push(acc)
+      acc += l.length + 1
+    }
+  }
+  allLines.forEach((l, i) => {
+    if (!WEIGHT_LABEL.test(l)) return
+    for (let k = i + 1; k < Math.min(i + 4, allLines.length); k++) {
+      const m = allLines[k].match(FULL_WEIGHT_NUM)
+      if (m) {
+        if (lineStart[k] > weightPos) {
+          weight = m[1]
+          weightPos = lineStart[k]
+        }
+        break
+      }
+      const t = allLines[k].trim()
+      // 纯英文碎片行（双语标签下半行，如 DateofBirth）与其他字段标签行跳过；实质内容行才停
+      if (t && !/^[A-Za-z\s]{1,20}$/.test(t) && !WEIGHT_SKIP.test(t)) break
+    }
+  })
   const nextMatch = (i: number, re: RegExp): string => {
     for (let k = i + 1; k < Math.min(i + 4, allLines.length); k++) {
       const m = allLines[k].match(re)
@@ -1151,7 +1185,7 @@ export function extractArchiveRow(o: ArchiveRowInput) {
   const BIRTH_LABEL = /Birth\s*Date|出生\s*日期|Date\s*of\s*Birth/i
   const SIRE_LABEL = /Father\s*No|父\s*号|父亲\s*编号|ID\s*of\s*the\s*father/i
   const DAM_LABEL = /Mother\s*No|母\s*号|母亲\s*编号|ID\s*of\s*the\s*Mother/i
-  const SEX_LABEL = /Sex\s*性别|性别\s*\/?\s*Sex/i
+  const SEX_LABEL = /Sex\s*性别|性别\s*(?:\/\s*(?:Sex|Gender))?|(?<![A-Za-z])Sex(?![A-Za-z])|(?<![A-Za-z])Gender(?![A-Za-z])/i // 单行双语或单独「性别」/「Sex」/「Gender」标签行均认；带词边界防误伤含 Sex 的英文单词
   allLines.forEach((l, i) => {
     const after = (re: RegExp) => {
       const m = l.match(re)
@@ -1184,7 +1218,7 @@ export function extractArchiveRow(o: ArchiveRowInput) {
   const missing: string[] = []
   if (!sexFinal) missing.push('性别未识别')
   if (!birthFinal) missing.push('出生日期未识别')
-  if (!sireFinal) missing.push('父亲编号未识别')
+  if (!sireL && !sireFinal) missing.push('父亲编号未识别')
   if (!damFinal) missing.push('母亲编号未识别')
   if (!weight) missing.push('体重未识别')
   return {
