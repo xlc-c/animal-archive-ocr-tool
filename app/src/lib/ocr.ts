@@ -1218,7 +1218,7 @@ export function extractArchiveRow(o: ArchiveRowInput) {
   const missing: string[] = []
   if (!sexFinal) missing.push('性别未识别')
   if (!birthFinal) missing.push('出生日期未识别')
-  if (!sireL && !sireFinal) missing.push('父亲编号未识别')
+  if (!sireFinal) missing.push('父亲编号未识别')
   if (!damFinal) missing.push('母亲编号未识别')
   if (!weight) missing.push('体重未识别')
   return {
