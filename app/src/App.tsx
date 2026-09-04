@@ -1330,7 +1330,7 @@ export default function App() {
         )}
 
         <footer className="mt-16 border-t border-[#e3e0d6] pt-6 text-xs leading-relaxed text-[#6b675c]">
-          <p className="mb-1 text-[#9a958a]">构建版本 2026-08-25 v1.1.3 · 完全离线运行，文件不上传。</p>
+          <p className="mb-1 text-[#9a958a]">构建版本 2026-09-04 v1.1.4 · 完全离线运行，文件不上传。</p>
           <p>
             提示：下载到的是拆分重命名后的副本，原始文件不会被改动。
             猪识别「耳标号/耳号/纹身号」，猴子识别「猴号/动物编号」，犬识别「耳号/芯片号」。
