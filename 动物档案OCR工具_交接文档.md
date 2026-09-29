@@ -1,7 +1,8 @@
 # 动物档案 OCR 识别拆分工具 —— 项目交接文档
 
-> 交接日期：2026-09-04 ｜ 版本：v1.1.4 字段分行版式修复（体重/性别分行取值 / 性别标签放宽 / 装箱单关键词拦截）
-> 上一版：2026-08-25 ｜ v1.1.3 结构判定与人工核对闭环（清单页页内结构判定 / 花名册字母簇优先 / 预览内手动拆分 / 花名册规模可视化）
+> 交接日期：2026-09-29 ｜ 版本：v1.1.5 JPEG2000 解码支持（内嵌 OpenJPEG wasm + 主线程 BinaryDataFactory 供字节）
+> 上一版：2026-09-04 ｜ v1.1.4 字段分行版式修复（体重/性别分行取值 / 性别标签放宽 / 装箱单关键词拦截）
+> 更早：2026-08-25 ｜ v1.1.3 结构判定与人工核对闭环（清单页页内结构判定 / 花名册字母簇优先 / 预览内手动拆分 / 花名册规模可视化）
 > 更早：2026-08-24 ｜ v1.1.2 交付健壮性加固（全局错误条 / 完整性自检 / 预览懒加载 / 免 MOTW 导出 / 1DAM 双保险）
 > 本文档写给在 VS Code 上接手的 AI 编程助手（Kimi Code）或开发者。请先通读"踩坑记录"再动代码——本项目大部分复杂度来自已经踩过的坑，重蹈覆辙的代价很高。
 
@@ -129,6 +130,9 @@ bash rebuild.sh    # 完整构建：dist/ + dist-offline/（单文件离线版�
 56. **装箱单关键词双保险**（2026-09-04）：标题含「装箱」的单据页（实验动物装箱单，文字层版式一页 37 个同形态编号）之前不在 isFormDoc 关键词里，pool 补救会把表单编号抓成动物编号。isFormDoc 正则补「装箱」→ 跳过候选池与兜底通道。页内编号簇 ≥5 的 listPage 结构判定（踩坑 53）本来就会拦截这类页，标题关键词是第二道独立防线：OCR 把标题读烂时结构判定兜底，编号不满 5 个的小装箱单由标题关键词兜底。harness 断言：37 编号装箱页 listPage=true / animalId=null；装箱标题页不抓候选池（对照组无关键词标题正常抓到，证明断言有效）。
 57. **结果异常先核对版本戳——旧版混用实战**（2026-09-03）：猪批次结果异常排查时，有人拿旧版（v1.1.3 之前）构建复现，竟踩出踩坑 53 的 OD 值簇劫持名册（抗体检测表 ~50 个 4 位纯数字 OD 值簇挤掉 B 编号动物名册 → 全批标「编号不在花名册」），而 v1.1.3 早已修复——纯浪费排查轮次。教训：**复现/排查任何结果异常前，先核对页面页脚「构建版本」戳是否最新**；旧 html 副本（U 盘/下载目录/微信转发）与新构建混用时极易中招。版本戳每次发版必更新（App.tsx 页脚，`grep 构建版本 src/App.tsx` 确认只有一处），rebuild 后必须 grep 产物里的版本戳再分发。
 
+### JPEG2000 解码（2026-09-29 新增，v1.1.5）
+58. **JPXDecode（JPEG2000）图像的 PDF 在离线单文件版全空白**：用户的订单 PDF 页面图像是 JPEG2000 编码（`/Filter /JPXDecode`），pdf.js 解码 JPX 需要 `pdfjs-dist/wasm/openjpeg.wasm`（OpenJPEG 编译版），而本工具是 file:// 双击的单文件 HTML，getDocument 没配 wasmUrl，worker 内 fetch / 动态 import 都无路加载解码器 → 每页图像解码失败 → 渲染空白 → OCR 全空 → 整批「未识别」。控制台报错三连：`JpxError: OpenJPEG failed to initialize`、`Ensure that the 'wasmUrl' API parameter is provided`、`Failed to resolve module specifier 'nullopenjpeg_nowasm_fallback.js'`。**症状极具迷惑性**：预览空白、OCR 全空，但下载的拆分文件完全正常（pdf-lib 只搬运页面不解码），福昕/浏览器自带阅读器打开也正常（PDFium 自带 JPX 解码）——「浏览器能看、工具空白」时先想图像编码格式。修法（ocr.ts + vite.config.ts）：① openjpeg.wasm（250KB）用自建 vite 插件 `?b64` 查询 base64 内嵌进包——Vite 自带 wasm 插件会接管 .wasm 导入，`?inline` 对 .wasm 不生效（构建报 "Unexpected character '\0'"），且 **worker 子构建（ocrWorker）是独立 rollup 实例，默认不带主配置插件，wasmB64 必须同时挂到 `config.worker.plugins`**；② ocr.ts 定义 `EmbeddedBinaryDataFactory` 并传给 `getDocument({ BinaryDataFactory })`——pdf.js 未配 wasmUrl 时走 useWorkerFetch=false 路径，worker 用 FetchBinaryData 消息向主线程要 wasm 字节，自定义工厂直接把内嵌字节喂回去，全程零网络加载，比「worker 引导段 + self.fetch 拦截 + wasmUrl 哨兵」方案更简（BinaryDataFactory 本就是 pdf.js 的扩展点）；③ 其他 wasm（jbig2/qcms）与 cMap/字体请求维持原「未配置」报错行为不变。e2e 验证：10 页 JPXDecode 测试 PDF 在 file:// 下处理完成，控制台零 JpxError，OCR 原文非空。
+
 ## 5. 当前已完成功能
 
 - PP-OCRv4 mobile 中英识别、多通道编号提取（标签 > 文件名 > 候选池 > 兜底）
@@ -163,6 +167,7 @@ bash rebuild.sh    # 完整构建：dist/ + dist-offline/（单文件离线版�
 - **体重分行版式提取**（标签与值各占独立 OCR 行时向下 3 行找整行数字，同行/分行共用「最后一次称重」文本序语义，见踩坑 55）
 - **性别标签放宽**（单独「性别」/「Sex」/「Gender」标签行也认，分行取值；找不到保持未识别绝不硬猜，见踩坑 55）
 - **装箱单关键词拦截**（isFormDoc 补「装箱」，标题关键词 + 页内结构判定双保险，见踩坑 56）
+- **JPEG2000 扫描件支持**（OpenJPEG 解码器内嵌，见踩坑 58）
 
 ## 6. 待办清单（已与需求方讨论确认方向，按优先级）
 
