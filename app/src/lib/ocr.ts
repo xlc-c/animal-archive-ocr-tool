@@ -2,6 +2,10 @@
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs'
 // worker 内联为 blob：file:// 双击运行时无法加载外部 worker 文件
 import PdfWorker from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?worker&inline'
+// JPEG2000（JPXDecode）解码器字节：pdf.js 解码 JPX 图像需要 openjpeg.wasm，
+// 离线单文件（file://）下 worker 内 fetch/动态 import 都加载不到它，
+// 直接 base64 内嵌进包（?b64 自建查询，见 vite.config.ts），约 250KB。
+import openjpegWasmB64 from 'pdfjs-dist/wasm/openjpeg.wasm?b64'
 import {
   recognizeCanvasPaddle,
   initEngine,
@@ -11,6 +15,32 @@ import {
 } from './paddleOcr'
 
 pdfjs.GlobalWorkerOptions.workerPort = new PdfWorker()
+
+/** base64 → 字节（模块加载时一次性解码，主线程 250KB 无感） */
+function decodeB64(b64: string): Uint8Array {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+const openjpegWasmBytes = decodeB64(openjpegWasmB64)
+
+/**
+ * 内嵌 wasm 二进制工厂：pdf.js 未配 wasmUrl 时（本工具的场景）走
+ * useWorkerFetch=false 路径——worker 用 FetchBinaryData 消息向主线程要
+ * wasm 字节，主线程由 BinaryDataFactory 供给。默认的 DOMBinaryDataFactory
+ * 会去 fetch URL（file:// 下必败），换成直接从内嵌字节返回，零网络加载。
+ * openjpeg.wasm 之外的请求（cMap/字体/jbig2 等）维持原「未配置」报错行为。
+ */
+class EmbeddedBinaryDataFactory {
+  // pdf.js 会 new BinaryDataFactory({cMapUrl, standardFontDataUrl, wasmUrl})，参数忽略
+  async fetch({ kind, filename }: { kind: string; filename: string }): Promise<Uint8Array> {
+    if (kind === 'wasmUrl' && filename === 'openjpeg.wasm') {
+      return openjpegWasmBytes
+    }
+    throw new Error(`Ensure that the \`${kind}\` API parameter is provided.`)
+  }
+}
 
 export type { OcrLine }
 
@@ -36,7 +66,10 @@ export async function openPdf(file: File): Promise<OpenedPdf> {
 /** 从 buffer 打开 PDF（Worker 里只有 buffer，没有 File） */
 export async function openPdfBuffer(buf: ArrayBuffer): Promise<OpenedPdf> {
   // pdfjs 会转移（detach）传入的 buffer，给它一份拷贝，原件留给拆分用
-  const doc = await pdfjs.getDocument({ data: buf.slice(0) }).promise
+  const doc = await pdfjs.getDocument({
+    data: buf.slice(0),
+    BinaryDataFactory: EmbeddedBinaryDataFactory,
+  }).promise
   return { doc, buf, pageCount: doc.numPages }
 }
 
