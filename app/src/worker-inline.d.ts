@@ -6,3 +6,7 @@ declare module '*?raw' {
   const content: string
   export default content
 }
+declare module '*?b64' {
+  const base64: string
+  export default base64
+}

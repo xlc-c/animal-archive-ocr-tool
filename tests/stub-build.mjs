@@ -29,6 +29,10 @@ const stubPlugin = {
       if (args.path.includes('worker')) {
         return { contents: `export default class PdfWorkerStub {}` }
       }
+      // openjpeg.wasm?inline（v1.1.5 JPX 支持）：node 下给空 data URL，模块顶层解码得空字节即可
+      if (args.path.includes('openjpeg')) {
+        return { contents: `export default ''` }
+      }
       // pdf.mjs：ocr.ts 顶层会执行 pdfjs.GlobalWorkerOptions.workerPort = new PdfWorker()
       return {
         contents: `
