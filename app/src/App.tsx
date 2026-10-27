@@ -18,6 +18,23 @@ type Status = 'waiting' | 'working' | 'done' | 'failed'
 type NamingMode = 'id' | 'title_id' | 'title' | 'template'
 type SplitMode = 'group' | 'page' | 'whole'
 
+/**
+ * 「合并相同编号」的分组键：只用于分组，不改变 Excel/文件名里显示的原值。
+ * 不同批次、不同来源（OCR 识别 / 文件名回退 / 清单纠错）给出的编号常有无关差异，
+ * 严格字符串相等会把同一只动物判成两只：
+ *   - 全角数字/字母（１２３ vs 123）
+ *   - 前后空白、中间空格（Ear No 12 3）
+ *   - 前导零（00123 vs 123）
+ *   - 大小写（t123 vs T123）
+ */
+function idMergeKey(id: string): string {
+  return id
+    .replace(/[０-９Ａ-Ｚａ-ｚ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/\s+/g, '')
+    .toUpperCase()
+    .replace(/^0+(?=\d)/, '')
+}
+
 interface PdfItem {
   id: string
   file: File
@@ -338,10 +355,11 @@ export default function App() {
           result.push(o)
           continue
         }
-        const g = byId.get(o.animalId)
+        const key = idMergeKey(o.animalId)
+        const g = byId.get(key)
         if (g) g.push(o)
         else {
-          byId.set(o.animalId, [o])
+          byId.set(key, [o])
           result.push(o) // 首项占位，保持原顺序
         }
       }

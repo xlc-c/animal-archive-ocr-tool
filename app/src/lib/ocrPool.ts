@@ -24,9 +24,15 @@ interface QueuedTask {
   run: (call: (msg: Record<string, unknown>, transfer?: Transferable[]) => void) => void
 }
 
-/** 自动并行度：4 核 1 路、8 核 2 路、12 核以上 3 路封顶（每路要吃掉模型+页面位图内存） */
+/**
+ * 自动并行度：4 核 1 路、8 核 2 路、12 核以上 3 路封顶（每路要吃掉模型+页面位图内存）。
+ * 低内存设备（deviceMemory ≤ 4GB）强制单路：3 份模型常驻 + 逐页位图很容易把标签页撑爆，
+ * 表现为「预览正常、页数一多就识别不出」。
+ */
 export function autoPoolSize(): number {
   const cores = navigator.hardwareConcurrency ?? 4
+  const mem = (navigator as Navigator & { deviceMemory?: number }).deviceMemory
+  if (mem !== undefined && mem <= 4) return 1
   return Math.max(1, Math.min(3, Math.floor(cores / 4)))
 }
 

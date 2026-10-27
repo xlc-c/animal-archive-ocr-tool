@@ -10,6 +10,7 @@ import {
   recognizeCanvasPaddle,
   initEngine,
   makeCanvas,
+  releaseCanvas,
   type AnyCanvas,
   type OcrLine,
 } from './paddleOcr'
@@ -88,11 +89,16 @@ export async function renderPage(
   ctx.fillStyle = '#ffffff'
   ctx.fillRect(0, 0, canvas.width, canvas.height)
   // pdfjs 类型签名只认主线程 canvas；OffscreenCanvas 的 2d context 运行时可用，做断言
-  await page.render({
-    canvasContext: ctx as CanvasRenderingContext2D,
-    viewport,
-    canvas: canvas as HTMLCanvasElement,
-  }).promise
+  try {
+    await page.render({
+      canvasContext: ctx as CanvasRenderingContext2D,
+      viewport,
+      canvas: canvas as HTMLCanvasElement,
+    }).promise
+  } finally {
+    // 释放 pdf.js 侧该页的渲染资源；不清的话页数一多内存单调增长
+    page.cleanup()
+  }
   return canvas
 }
 
@@ -161,16 +167,22 @@ export async function renderTopRegion(
   const ctx = full.getContext('2d')!
   ctx.fillStyle = '#ffffff'
   ctx.fillRect(0, 0, full.width, full.height)
-  await page.render({
-    canvasContext: ctx as CanvasRenderingContext2D,
-    viewport,
-    canvas: full as HTMLCanvasElement,
-  }).promise
+  try {
+    await page.render({
+      canvasContext: ctx as CanvasRenderingContext2D,
+      viewport,
+      canvas: full as HTMLCanvasElement,
+    }).promise
+  } finally {
+    page.cleanup()
+  }
   const cropH = Math.round(full.height * 0.3)
   const crop = makeCanvas(full.width, cropH)
   const cctx = crop.getContext('2d')!
   cctx.drawImage(full, 0, 0, full.width, cropH, 0, 0, full.width, cropH)
   binarize(crop)
+  // 整页高清图只在裁剪时用到，裁完立刻释放（这张比普通页更大）
+  releaseCanvas(full)
   return crop
 }
 
@@ -264,7 +276,12 @@ export async function ocrIdCell(
     cctx.fillStyle = '#ffffff'
     cctx.fillRect(0, 0, cell.width, cell.height)
     cctx.drawImage(top, rg.x0, rg.y0, rw, rh, 0, 0, cell.width, cell.height)
-    out.push(...(await recognizeCanvas(cell)))
+    try {
+      out.push(...(await recognizeCanvas(cell)))
+    } finally {
+      // 放大重识别是逐格进行的，不释放的话顽固页会累积几十张小位图
+      releaseCanvas(cell)
+    }
   }
   return { lines: out, height: top.height }
 }

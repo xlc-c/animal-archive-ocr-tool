@@ -20,7 +20,7 @@ import {
   type OpenedPdf,
   type OcrLine,
 } from './ocr'
-import { initEngine, setBaseUrl } from './paddleOcr'
+import { initEngine, setBaseUrl, releaseCanvas } from './paddleOcr'
 import { setBinBytes, type BinBytes } from '../assets/binData'
 
 interface WorkerRequest {
@@ -77,8 +77,14 @@ async function handle(req: WorkerRequest): Promise<Partial<WorkerResponse>> {
       const canvas = req.hd
         ? await renderTopRegion(opened.doc, req.pageIndex!)
         : await renderPage(opened.doc, req.pageIndex!)
-      const lines = await recognizeCanvas(canvas)
-      return { lines, height: canvas.height }
+      const height = canvas.height
+      try {
+        const lines = await recognizeCanvas(canvas)
+        return { lines, height }
+      } finally {
+        // 一页位图 20–30MB，逐页释放，避免整本合集跑下来内存单调上涨
+        releaseCanvas(canvas)
+      }
     }
     case 'ocrIdCell': {
       const opened = docs.get(req.docId!)

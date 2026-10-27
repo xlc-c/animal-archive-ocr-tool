@@ -32,6 +32,21 @@ export function makeCanvas(w: number, h: number): AnyCanvas {
   return new OffscreenCanvas(w, h)
 }
 
+/**
+ * 主动释放画布位图内存。
+ * 页面位图一页可达 20–30MB（3000px 长边），只靠 GC 回收不及时：
+ * 整本合集几百页时会单调增长，最终把 OCR Worker 撑爆（Chrome 上表现为
+ * 「预览正常、识别全空」）。把它归零后会立刻释放底层位图。
+ */
+export function releaseCanvas(c: AnyCanvas): void {
+  try {
+    c.width = 0
+    c.height = 0
+  } catch {
+    // 已 detached 的 OffscreenCanvas 赋值可能抛错，忽略即可
+  }
+}
+
 // wasm 二进制内嵌在 bundle 里：file:// 双击运行时无法发任何请求，
 // 通过 env.wasm.wasmBinary 直给字节，运行时不产生任何 .wasm 网络/文件加载。
 // 强制单线程：file:// 无 SharedArrayBuffer，且单线程已够快。
